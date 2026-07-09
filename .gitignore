@@ -8,4 +8,9 @@ dist/
 # Ignora todos os arquivos com uma extensão específica
 *.log
 *.db
-*.txt
+
+# Ignora arquivos pycache e diretórios __pycache__
+__pycache__/
+
+# Ignora arquivos específicos
+raw_history.txt

@@ -1,0 +1,14 @@
+# O PORQUE: Streamlit fixado numa versão exata confirmada (evita que uma
+# atualização automática mude o comportamento do app sem você perceber,
+# especialmente no Community Cloud, que reinstala tudo a cada deploy). As
+# demais dependências usam um piso mínimo (>=) em vez de uma versão exata,
+# porque eu não tinha como confirmar ao certo qual é a última versão de
+# cada uma no momento em que gerei este arquivo -- prefiro isso a arriscar
+# fixar um número que nem exista e quebrar a instalação. Se quiser fixar
+# todas depois, rode `pip freeze` no ambiente já funcionando e copie os
+# números exatos para cá.
+streamlit==1.59.0
+pandas>=2.2
+numpy>=1.26
+plotly>=5.24
+libsql>=0.1.0

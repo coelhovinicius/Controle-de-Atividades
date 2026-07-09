@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from database_core import DatabaseConnection, LogRepository
 from importer_core import HistoryParser
 
-st.set_page_config(page_title="Task Tracker ", layout="wide")
+st.set_page_config(page_title="Task Tracker ", layout="wide", initial_sidebar_state="collapsed")
 
 # O PORQUE: por padrão, o texto das abas do Streamlit sai pequeno e sem
 # destaque visual, dificultando a navegação. Este CSS aumenta o tamanho da
