@@ -1,0 +1,11 @@
+# Ignora arquivos de configuração de ambiente (como senhas e chaves)
+.env
+
+# Ignora uma pasta inteira (ex: pastas de dependências ou build)
+node_modules/
+dist/
+
+# Ignora todos os arquivos com uma extensão específica
+*.log
+*.db
+*.txt

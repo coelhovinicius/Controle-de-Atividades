@@ -1,0 +1,7 @@
+[server]
+# O PORQUE: server.maxUploadSize e o limite "oficial" do Streamlit para
+# qualquer st.file_uploader do app (em MB). E aplicado antes mesmo do
+# arquivo chegar por completo ao servidor. A checagem extra em app.py
+# (MAX_UPLOAD_SIZE_MB) e uma segunda camada de seguranca, caso este
+# config.toml nao seja carregado no ambiente de deploy.
+maxUploadSize = 20
