@@ -1,17 +1,16 @@
 """
 Script de correção pontual (rodar UMA VEZ) para reclassificar registros que
-foram importados como "Job Boards" ou "Passaporte" antes da separação dos
-projetos "Vagas" e "Price Up" nas keywords do parser (import_history.py /
-importer_core.py).
+foram importados como "Job Boards", "Passaporte" ou "360" antes da separação
+dos projetos "Vagas"/"Price Up"/"Backoffice"/"Cockpit" nas keywords do parser
+(import_history.py / importer_core.py).
 
-O PORQUE: antes dessa mudança, a keyword "vagas" apontava para o projeto
-"Job Boards" e a keyword "price up" apontava para "Passaporte" (embora
-"Vagas" e "Price Up" já existissem como opções separadas no formulário
-manual de inclusão/edição). Este script corrige apenas os registros
-históricos que foram classificados pela regra antiga, sem tocar em mais
-nada — é seguro rodar mais de uma vez: depois de corrigido, o WHERE não
-encontra mais nada (o project já não é mais "Job Boards"/"Passaporte" para
-essas linhas).
+O PORQUE: antes dessas mudanças, a keyword "vagas" apontava para o projeto
+"Job Boards", "price up" apontava para "Passaporte", e "backoffice"/"cockpit"
+apontavam para "360" (embora todos já existissem ou passassem a existir como
+projetos próprios). Este script corrige apenas os registros históricos que
+foram classificados pela regra antiga, sem tocar em mais nada — é seguro
+rodar mais de uma vez: depois de corrigido, o WHERE não encontra mais nada
+(o project já não é mais o antigo para essas linhas).
 
 Uso:
     python fix_project_reclassification.py [caminho_do_banco]
@@ -27,6 +26,8 @@ import sys
 RECLASSIFICATIONS = [
     ("Job Boards", "Vagas", "%vagas%"),
     ("Passaporte", "Price Up", "%price up%"),
+    ("360", "Backoffice", "%backoffice%"),
+    ("360", "Cockpit", "%cockpit%"),
 ]
 
 

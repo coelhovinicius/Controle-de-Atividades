@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from database_core import DatabaseConnection, LogRepository
 from importer_core import HistoryParser
 
-st.set_page_config(page_title="QA Task Tracker", layout="wide")
+st.set_page_config(page_title="Task Tracker ", layout="wide")
 
 # O PORQUE: por padrão, o texto das abas do Streamlit sai pequeno e sem
 # destaque visual, dificultando a navegação. Este CSS aumenta o tamanho da
@@ -52,6 +52,8 @@ PROJECT_COLORS = {
     "Vagas": "#9467bd",
     "Motor RCE": "#8c564b",
     "Price Up": "#e377c2",
+    "Backoffice": "#17becf",
+    "Cockpit": "#bcbd22",
     "Outros": "#7f7f7f",
 }
 
@@ -60,10 +62,35 @@ CATEGORY_COLORS = {
     "Execucao de Testes": "#ff7f0e",
     "Documentacao": "#2ca02c",
     "Reuniao": "#d62728",
-    "Resolucao de BUG/Problema": "#9467bd",
+    "Resolucao/Testes de BUG/Problema": "#9467bd",
     "Estudos/Certificacao": "#8c564b",
     "Outros": "#7f7f7f",
 }
+
+# O PORQUE: as listas de Projeto/Categoria antes eram fixas nos selectbox dos
+# formulários. Agora são a base + o que o usuário cadastrar em "custom_options"
+# (tabela no banco). "BASE_" porque continuam sendo o ponto de partida; a
+# lista final é montada em runtime por get_project_options()/get_category_options().
+# Backoffice e Cockpit entraram na base (e não como customizados) porque
+# viraram projetos "oficiais" do parser de importação (import_history.py /
+# importer_core.py), deixando de ser absorvidos por "360".
+BASE_PROJECT_OPTIONS = ["Sustentacao", "Passaporte", "360", "Job Boards", "Vagas", "Motor RCE", "Price Up", "Backoffice", "Cockpit", "Outros"]
+BASE_CATEGORY_OPTIONS = ["Desenvolvimento de Testes", "Execucao de Testes", "Documentacao", "Reuniao", "Resolucao/Testes de BUG/Problema", "Estudos/Certificacao"]
+
+# O PORQUE: paleta de reserva para Projetos/Categorias criados pelo usuário,
+# que não têm cor fixa definida em PROJECT_COLORS/CATEGORY_COLORS. Cicla pela
+# lista caso existam mais itens customizados do que cores disponíveis.
+EXTRA_COLOR_PALETTE = px.colors.qualitative.Set3
+
+
+def build_color_map(base_map: dict, values) -> dict:
+    color_map = dict(base_map)
+    idx = 0
+    for v in values:
+        if v not in color_map:
+            color_map[v] = EXTRA_COLOR_PALETTE[idx % len(EXTRA_COLOR_PALETTE)]
+            idx += 1
+    return color_map
 
 # O PORQUE: Limite de upload em MB. O valor "oficial" (que barra o arquivo
 # antes mesmo de chegar ao servidor) fica em .streamlit/config.toml
@@ -82,6 +109,75 @@ def get_repository():
 
 
 repo = get_repository()
+
+
+def get_project_options() -> list:
+    # O PORQUE: mantém "Outros" sempre por último (comportamento original),
+    # inserindo os projetos customizados logo antes dele.
+    custom = [p for p in repo.get_custom_options("project") if p not in BASE_PROJECT_OPTIONS]
+    return BASE_PROJECT_OPTIONS[:-1] + custom + [BASE_PROJECT_OPTIONS[-1]]
+
+
+def get_category_options() -> list:
+    custom = [c for c in repo.get_custom_options("category") if c not in BASE_CATEGORY_OPTIONS]
+    return BASE_CATEGORY_OPTIONS + custom
+
+
+# O PORQUE: opção especial no fim dos dropdowns de Projeto/Categoria dos
+# formulários de Registro/Edição. Ao escolhê-la, um campo de texto aparece
+# na hora para o usuário digitar um nome novo -- que é criado e persistido
+# em custom_options assim que confirmado (Enter/Tab), ficando disponível
+# nesse e em qualquer registro futuro, inclusive após sincronização via
+# upload de txt/csv (que só mexe em work_logs, nunca em custom_options).
+NEW_OPTION_SENTINEL = "➕ Criar novo..."
+
+
+def creatable_option_picker(label: str, option_type: str, options_fn, key_prefix: str, current_value: str = None):
+    # O PORQUE: precisa ficar FORA de qualquer st.form. Dentro de um form,
+    # widgets só reagem no submit -- aqui, ao escolher "Criar novo...", o
+    # campo de texto tem que aparecer imediatamente, e confirmar o texto já
+    # precisa gravar a nova opção e voltar a mostrar o dropdown com o valor
+    # recém-criado selecionado, tudo sem esperar o usuário clicar em Salvar.
+    options = list(options_fn())
+    if current_value and current_value not in options:
+        options.append(current_value)
+    display_options = options + [NEW_OPTION_SENTINEL]
+
+    select_key = f"{key_prefix}_select"
+    text_key = f"{key_prefix}_new_text"
+
+    if select_key not in st.session_state:
+        st.session_state[select_key] = current_value if current_value in display_options else display_options[0]
+
+    def _stage_new_option_confirmation():
+        # O PORQUE: callback do on_change do text_input. Em vez de gravar
+        # direto, abre a confirmação -- a criação de fato só acontece se o
+        # usuário confirmar no modal (ver dispatcher de 'processing_action').
+        typed = st.session_state.get(text_key, "").strip()
+        if not typed:
+            return
+        request_confirmation(
+            action_type="add_custom_option_inline",
+            payload={"option_type": option_type, "value": typed, "select_key": select_key, "text_key": text_key},
+            title=f"Criar novo(a) {label.lower()}",
+            message=f'Deseja criar o(a) {label.lower()} "{typed}" e usá-lo(a) neste registro?',
+            success_message=f'{label} "{typed}" criado(a) com sucesso!',
+            processing_message=f"Criando {label.lower()}...",
+            confirm_label="Sim, criar",
+            on_cancel_cleanup={text_key: ""},
+        )
+
+    choice = st.selectbox(label, display_options, key=select_key)
+
+    if choice == NEW_OPTION_SENTINEL:
+        st.text_input(
+            f"Digite o novo nome e pressione Enter",
+            key=text_key,
+            on_change=_stage_new_option_confirmation,
+        )
+        return None
+
+    return choice
 
 # O PORQUE: Sessões adicionadas para gerenciar os DataFrames temporários de sincronização (Diffing) sem perder o estado a cada interação com os checkboxes.
 if 'action_state' not in st.session_state:
@@ -114,6 +210,22 @@ if 'sort_column' not in st.session_state:
     st.session_state.sort_column = None
 if 'sort_ascending' not in st.session_state:
     st.session_state.sort_ascending = True
+if 'daily_report' not in st.session_state:
+    st.session_state.daily_report = None
+# O PORQUE: sistema genérico de confirmação + "processando" usado por todas
+# as ações que escrevem no banco (Projetos/Categorias customizados e, agora
+# também, os registros de atividade). 'confirm_action' guarda os dados de
+# uma confirmação pendente (título/mensagem/o que fazer se confirmado);
+# 'processing' + 'processing_action' guardam a ação já confirmada, aguardando
+# ser executada no próximo rerun -- é esse rerun intermediário que garante
+# que a tela de "Processando..." (sem nenhum outro widget interativo) seja
+# de fato desenhada ANTES da escrita no banco acontecer.
+if 'confirm_action' not in st.session_state:
+    st.session_state.confirm_action = None
+if 'processing' not in st.session_state:
+    st.session_state.processing = False
+if 'processing_action' not in st.session_state:
+    st.session_state.processing_action = None
 
 # O PORQUE: mapeia o rótulo exibido no cabeçalho para o nome real da coluna
 # no DataFrame, usado tanto para renderizar o botão quanto para ordenar.
@@ -129,6 +241,166 @@ def reset_states(full_reset=False):
     if full_reset:
         st.session_state.view_state = 'grid'
         st.session_state.target_id = None
+        # O PORQUE: sem isso, o dropdown de Projeto/Categoria do próximo
+        # "Novo Registro" reabriria com a última seleção (ou o texto digitado
+        # para criar uma opção nova) ainda preenchidos, por causa da key
+        # fixa do widget persistindo em st.session_state entre execuções.
+        for k in ("add_proj_select", "add_proj_new_text", "add_cat_select", "add_cat_new_text"):
+            st.session_state.pop(k, None)
+
+
+# ==========================================
+# CONFIRMAÇÃO + "PROCESSANDO..." (genérico)
+# ==========================================
+def render_processing_overlay(message: str = "Processando..."):
+    # O PORQUE: um <div> fixed cobrindo 100% da tela, com z-index alto,
+    # transmite visualmente o "sombreamento" pedido. A blindagem de verdade
+    # contra interação vem de como essa função é usada: enquanto
+    # st.session_state.processing for True, o script SÓ desenha isso (ver
+    # bloco mais abaixo) -- nenhum outro botão/campo é renderizado nessa
+    # execução, então não existe o que clicar.
+    st.markdown(
+        f"""
+        <div style="
+            position: fixed; inset: 0; width: 100vw; height: 100vh;
+            background: rgba(15, 17, 22, 0.55); backdrop-filter: blur(2px);
+            z-index: 999999; display: flex; flex-direction: column;
+            align-items: center; justify-content: center;
+        ">
+            <div style="
+                border: 6px solid rgba(255,255,255,0.25); border-top: 6px solid #ffffff;
+                border-radius: 50%; width: 54px; height: 54px;
+                animation: app-spin 0.8s linear infinite;
+            "></div>
+            <div style="margin-top: 18px; font-size: 1.05rem; font-weight: 600; color: #ffffff;">
+                {message}
+            </div>
+        </div>
+        <style>
+        @keyframes app-spin {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def request_confirmation(action_type: str, payload: dict, title: str, message: str,
+                          success_message: str, processing_message: str = "Processando...",
+                          confirm_label: str = "Sim, confirmar", on_cancel_cleanup: dict = None):
+    # O PORQUE: guarda a intenção de escrita (o quê + com quais dados) em vez
+    # de já executá-la. Só quando o usuário confirmar no modal é que ela vira
+    # 'processing_action' e é de fato executada (ver dispatcher abaixo).
+    st.session_state.confirm_action = {
+        "type": action_type,
+        "payload": payload,
+        "title": title,
+        "message": message,
+        "success_message": success_message,
+        "processing_message": processing_message,
+        "confirm_label": confirm_label,
+        "on_cancel_cleanup": on_cancel_cleanup or {},
+    }
+    st.rerun()
+
+
+def render_pending_confirmation():
+    action = st.session_state.confirm_action
+
+    @st.dialog(action["title"])
+    def _dialog():
+        st.write(action["message"])
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button(action["confirm_label"], type="primary", use_container_width=True):
+                st.session_state.processing = True
+                st.session_state.processing_action = action
+                st.session_state.confirm_action = None
+                st.rerun()
+        with col2:
+            if st.button("Cancelar", use_container_width=True):
+                # O PORQUE: limpa campos de texto/seleção deixados pendentes
+                # (ex.: o nome digitado no dropdown "Criar novo...") para a
+                # tela voltar ao estado anterior à tentativa de confirmação.
+                for k, v in action.get("on_cancel_cleanup", {}).items():
+                    st.session_state[k] = v
+                st.session_state.confirm_action = None
+                st.rerun()
+
+    _dialog()
+
+
+def execute_processing_action(action: dict) -> bool:
+    t = action["type"]
+    p = action["payload"]
+
+    if t == "add_custom_option":
+        ok = repo.add_custom_option(p["option_type"], p["value"])
+        st.session_state[f"manage_{p['option_type']}_new"] = ""
+        return ok
+
+    elif t == "rename_custom_option":
+        ok = repo.rename_custom_option(p["option_type"], p["old_value"], p["new_value"])
+        if ok:
+            st.session_state[f"manage_{p['option_type']}_select"] = p["new_value"]
+        return ok
+
+    elif t == "delete_custom_option":
+        repo.delete_custom_option(p["option_type"], p["value"])
+        # O PORQUE: o valor excluído não existe mais na lista de opções --
+        # sem isso, o selectbox da sidebar (que guarda a seleção pela key)
+        # tentaria reabrir com um valor inválido e quebraria.
+        st.session_state.pop(f"manage_{p['option_type']}_select", None)
+        return True
+
+    elif t == "add_custom_option_inline":
+        ok = repo.add_custom_option(p["option_type"], p["value"])
+        if ok:
+            st.session_state[p["select_key"]] = p["value"]
+        st.session_state[p["text_key"]] = ""
+        return ok
+
+    elif t == "insert_log":
+        d = p
+        repo.insert_log(d['date'], d['proj'], d['cat'], d['desc'], d['eff'], d.get('imp', False), d.get('duv', False))
+        reset_states(full_reset=True)
+        return True
+
+    elif t == "update_log":
+        d = p
+        repo.update_log(d['target_id'], d['date'], d['proj'], d['cat'], d['desc'], d['eff'], d.get('imp', False), d.get('duv', False))
+        reset_states(full_reset=True)
+        return True
+
+    elif t == "delete_log":
+        repo.delete_log(p["log_id"])
+        reset_states(full_reset=True)
+        return True
+
+    return True
+
+
+if st.session_state.processing:
+    # O PORQUE: nada além do overlay é desenhado nesta execução -- é isso
+    # que "impossibilita qualquer tipo de interação" enquanto processa, e não
+    # apenas um efeito visual por cima de botões que ainda poderiam ser
+    # clicados.
+    action = st.session_state.processing_action
+    render_processing_overlay(action.get("processing_message", "Processando..."))
+    ok = execute_processing_action(action)
+    st.session_state.processing = False
+    st.session_state.processing_action = None
+    if ok:
+        st.toast(action["success_message"], icon="✅")
+    else:
+        st.toast(
+            action.get("failure_message", "Não foi possível concluir: nome inválido ou já existente."),
+            icon="⚠️",
+        )
+    time.sleep(0.6)
+    st.rerun()
+
+if st.session_state.confirm_action:
+    render_pending_confirmation()
 
 
 def remove_accents(input_str: str) -> str:
@@ -143,6 +415,33 @@ def format_date_ptbr(iso_date: str) -> str:
         return datetime.strptime(iso_date, "%Y-%m-%d").strftime("%d/%m/%Y")
     except Exception:
         return iso_date
+
+
+def build_daily_suggestion(df_all: pd.DataFrame, date_from, date_to, flag_col: str) -> str:
+    # O PORQUE: gera o texto padrão de Impedimentos/Dúvidas a partir dos
+    # registros já marcados com a flag correspondente (is_impedimento /
+    # is_duvida), dentro do intervalo [date_from, date_to] selecionado na
+    # Daily. A flag vem de duas origens possíveis: marcada manualmente no
+    # checkbox do formulário, ou inferida automaticamente na importação de
+    # arquivo (.txt/.csv) via keywords.
+    empty_default = "Nenhum." if flag_col == "is_impedimento" else "Nenhuma."
+    if df_all.empty or flag_col not in df_all.columns:
+        return empty_default
+
+    df_tmp = df_all.copy()
+    df_tmp["log_date_dt"] = pd.to_datetime(df_tmp["log_date"]).dt.date
+    mask = (
+        (df_tmp["log_date_dt"] >= date_from)
+        & (df_tmp["log_date_dt"] <= date_to)
+        & (df_tmp[flag_col].astype(int) == 1)
+    )
+    flagged = df_tmp.loc[mask]
+
+    if flagged.empty:
+        return empty_default
+
+    lines = [f"- [{row['project']}] {row['description']}" for _, row in flagged.iterrows()]
+    return "\n".join(lines)
 
 
 def validar_formulario_atividade(descricao: str, esforco_horas) -> list:
@@ -173,10 +472,14 @@ def dialog_confirmar_exclusao():
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Sim, excluir", type="primary", use_container_width=True):
-            repo.delete_log(st.session_state.target_id)
-            reset_states(full_reset=True)
-            st.success("Registro excluído com sucesso!")
-            time.sleep(1)
+            st.session_state.processing = True
+            st.session_state.processing_action = {
+                "type": "delete_log",
+                "payload": {"log_id": st.session_state.target_id},
+                "success_message": "Registro excluído com sucesso!",
+                "processing_message": "Excluindo registro...",
+            }
+            st.session_state.confirm_state = None
             st.rerun()
     with col2:
         if st.button("Cancelar", use_container_width=True):
@@ -190,11 +493,14 @@ def dialog_confirmar_novo_registro():
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Sim, salvar", type="primary", use_container_width=True):
-            d = st.session_state.pending_data
-            repo.insert_log(d['date'], d['proj'], d['cat'], d['desc'], d['eff'])
-            reset_states(full_reset=True)
-            st.success("Registro salvo com sucesso!")
-            time.sleep(1)
+            st.session_state.processing = True
+            st.session_state.processing_action = {
+                "type": "insert_log",
+                "payload": dict(st.session_state.pending_data),
+                "success_message": "Registro salvo com sucesso!",
+                "processing_message": "Salvando registro...",
+            }
+            st.session_state.confirm_state = None
             st.rerun()
     with col2:
         if st.button("Voltar", use_container_width=True):
@@ -222,11 +528,16 @@ def dialog_confirmar_edicao():
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Sim, salvar", type="primary", use_container_width=True):
-            d = st.session_state.pending_data
-            repo.update_log(st.session_state.target_id, d['date'], d['proj'], d['cat'], d['desc'], d['eff'])
-            reset_states(full_reset=True)
-            st.success("Registro atualizado com sucesso!")
-            time.sleep(1)
+            payload = dict(st.session_state.pending_data)
+            payload['target_id'] = st.session_state.target_id
+            st.session_state.processing = True
+            st.session_state.processing_action = {
+                "type": "update_log",
+                "payload": payload,
+                "success_message": "Registro atualizado com sucesso!",
+                "processing_message": "Salvando alterações...",
+            }
+            st.session_state.confirm_state = None
             st.rerun()
     with col2:
         if st.button("Voltar", use_container_width=True):
@@ -248,9 +559,105 @@ def dialog_confirmar_descarte_edicao():
             st.rerun()
 
 
-st.title("QA Tracker & Insights")
+# ==========================================
+# SIDEBAR: GERENCIAR PROJETOS E CATEGORIAS
+# ==========================================
+# O PORQUE: fica na sidebar (e não dentro de uma aba específica) para estar
+# disponível em qualquer tela, já que Projeto/Categoria são usados tanto no
+# Registro de Atividades quanto nos filtros do Dashboard.
+def _manage_options_panel(label_singular: str, option_type: str, base_options: list, get_options_fn):
+    # O PORQUE: painel único reaproveitado para Projeto e Categoria. Mostra
+    # um dropdown com TODOS os nomes cadastrados (padrão do sistema +
+    # customizados) para consulta/seleção, com ações de editar (renomear) e
+    # excluir para os customizados, além de um campo para incluir novos.
+    # Os nomes "padrão" (BASE_PROJECT_OPTIONS/BASE_CATEGORY_OPTIONS) também
+    # alimentam PROJECT_KEYWORDS/CATEGORY_KEYWORDS (parser de importação) e o
+    # mapa de cores fixo dos gráficos -- por isso ficam visíveis aqui para
+    # consulta, mas só os customizados podem ser renomeados/excluídos.
+    all_options = get_options_fn()
+    custom_options = repo.get_custom_options(option_type)
 
-tab_manage, tab_dashboard, tab_sync = st.tabs(["Registro de Atividades", "Dashboard & Relatórios", "Sincronização de Arquivo"])
+    picked = st.selectbox(
+        f"{label_singular}s cadastrados",
+        all_options,
+        key=f"manage_{option_type}_select",
+    )
+    is_custom = picked in custom_options
+
+    if is_custom:
+        col_edit, col_del = st.columns([3, 1])
+        new_name = col_edit.text_input(
+            "Renomear para",
+            value=picked,
+            key=f"manage_{option_type}_rename_{picked}",
+            label_visibility="collapsed",
+        )
+        if col_edit.button("💾 Salvar novo nome", key=f"manage_{option_type}_rename_btn_{picked}", use_container_width=True):
+            new_name_clean = (new_name or "").strip()
+            if not new_name_clean or new_name_clean == picked:
+                st.warning("Digite um nome novo e diferente do atual.")
+            else:
+                request_confirmation(
+                    action_type="rename_custom_option",
+                    payload={"option_type": option_type, "old_value": picked, "new_value": new_name_clean},
+                    title=f"Renomear {label_singular.lower()}",
+                    message=(
+                        f'Deseja renomear "{picked}" para "{new_name_clean}"? '
+                        f"Os registros que já usam \"{picked}\" serão atualizados para o novo nome."
+                    ),
+                    success_message=f'"{picked}" renomeado(a) para "{new_name_clean}" com sucesso!',
+                    processing_message=f"Renomeando {label_singular.lower()}...",
+                    confirm_label="Sim, renomear",
+                )
+        if col_del.button("🗑️", key=f"manage_{option_type}_del_{picked}", help=f"Excluir '{picked}' (não apaga registros já usando este {label_singular.lower()})", use_container_width=True):
+            request_confirmation(
+                action_type="delete_custom_option",
+                payload={"option_type": option_type, "value": picked},
+                title=f"Excluir {label_singular.lower()}",
+                message=(
+                    f'Tem certeza que deseja excluir "{picked}"? Essa ação não pode ser desfeita '
+                    f"(registros que já usam este nome não serão apagados)."
+                ),
+                success_message=f'"{picked}" excluído(a) com sucesso!',
+                processing_message=f"Excluindo {label_singular.lower()}...",
+                confirm_label="Sim, excluir",
+            )
+    else:
+        st.caption(f"'{picked}' é um {label_singular.lower()} padrão do sistema e não pode ser editado ou excluído.")
+
+    st.markdown("---")
+    st.caption(f"Incluir novo {label_singular.lower()}:")
+    new_value = st.text_input(f"Nome do(a) novo(a) {label_singular.lower()}", key=f"manage_{option_type}_new", label_visibility="collapsed")
+    if st.button(f"➕ Adicionar {label_singular.lower()}", key=f"manage_{option_type}_add_btn", use_container_width=True):
+        new_value_clean = (new_value or "").strip()
+        if not new_value_clean:
+            st.error("Digite um nome válido.")
+        elif new_value_clean in all_options:
+            st.warning(f"Esse {label_singular.lower()} já existe.")
+        else:
+            request_confirmation(
+                action_type="add_custom_option",
+                payload={"option_type": option_type, "value": new_value_clean},
+                title=f"Criar novo(a) {label_singular.lower()}",
+                message=f'Deseja criar o(a) {label_singular.lower()} "{new_value_clean}"?',
+                success_message=f'"{new_value_clean}" criado(a) com sucesso!',
+                processing_message=f"Criando {label_singular.lower()}...",
+                confirm_label="Sim, criar",
+            )
+
+
+with st.sidebar:
+    st.subheader("⚙️ Projetos e Categorias")
+
+    with st.expander("📁 Novo Nome de Projeto"):
+        _manage_options_panel("Projeto", "project", BASE_PROJECT_OPTIONS, get_project_options)
+
+    with st.expander("🏷️ Novo Nome de Categoria"):
+        _manage_options_panel("Categoria", "category", BASE_CATEGORY_OPTIONS, get_category_options)
+
+st.title("📊 Task Tracker")
+
+tab_manage, tab_daily, tab_dashboard, tab_sync = st.tabs(["Registro de Atividades", "Daily Scrum", "Dashboard & Relatórios", "Sincronização de Arquivo"])
 
 # ==========================================
 # TAB 1: REGISTRO DE ATIVIDADES (GRID & CRUD)
@@ -388,7 +795,15 @@ with tab_manage:
                     cols[1].write(format_date_ptbr(row["log_date"]))
                     cols[2].write(row["project"])
                     cols[3].write(row["category"])
-                    cols[4].write(row["description"])
+                    # O PORQUE: prefixo visual (não altera o texto salvo) para
+                    # identificar de relance quais registros estão marcados
+                    # como Impedimento e/ou Dúvida sem precisar abrir cada um.
+                    flag_prefix = ""
+                    if bool(int(row.get("is_impedimento", 0) or 0)):
+                        flag_prefix += "🚧 "
+                    if bool(int(row.get("is_duvida", 0) or 0)):
+                        flag_prefix += "❓ "
+                    cols[4].write(f"{flag_prefix}{row['description']}")
                     cols[5].write(str(row["effort_hours"]))
 
                     with cols[6]:
@@ -407,88 +822,368 @@ with tab_manage:
 
     if st.session_state.view_state == 'add':
         st.header("Novo Registro")
-        st.caption("Todos os campos abaixo são obrigatórios.")
-        with st.form("add_form"):
-            col_d, col_p, col_c, col_e = st.columns(4)
-            with col_d:
-                log_date = st.date_input("Data (DD/MM/AAAA)", format="DD/MM/YYYY")
-            with col_p:
-                project = st.selectbox("Projeto", ["Sustentacao", "Passaporte", "360", "Job Boards", "Vagas", "Motor RCE", "Price Up", "Outros"])
-            with col_c:
-                category = st.selectbox("Categoria", ["Desenvolvimento de Testes", "Execucao de Testes", "Documentacao", "Reuniao", "Resolucao de BUG/Problema", "Estudos/Certificacao"])
-            with col_e:
-                effort_hours = st.number_input("Esforço (Horas)", min_value=0.0, step=0.5, value=1.0)
+        st.caption(
+            "Todos os campos abaixo são obrigatórios. Em Projeto/Categoria, escolha "
+            "\"➕ Criar novo...\" para digitar (e já criar) um nome novo na hora."
+        )
+        # O PORQUE: este bloco NÃO usa st.form -- Projeto/Categoria precisam
+        # reagir imediatamente (mostrar o campo de texto ao escolher "Criar
+        # novo...", e voltar ao dropdown assim que o nome for confirmado),
+        # o que só funciona fora de um form. As confirmações continuam
+        # existindo do mesmo jeito, via modal (st.dialog), como no resto do app.
+        col_d, col_p, col_c, col_e = st.columns(4)
+        with col_d:
+            log_date = st.date_input("Data (DD/MM/AAAA)", format="DD/MM/YYYY", key="add_log_date")
+        with col_p:
+            project = creatable_option_picker("Projeto", "project", get_project_options, key_prefix="add_proj")
+        with col_c:
+            category = creatable_option_picker("Categoria", "category", get_category_options, key_prefix="add_cat")
+        with col_e:
+            effort_hours = st.number_input("Esforço (Horas)", min_value=0.0, step=0.5, value=1.0, key="add_effort")
 
-            description = st.text_area("Descrição da Atividade *")
+        description = st.text_area("Descrição da Atividade *", key="add_description")
 
-            col_save, col_canc = st.columns(2)
-            with col_save:
-                btn_save = st.form_submit_button("Salvar Registro", type="primary", use_container_width=True)
-            with col_canc:
-                btn_canc = st.form_submit_button("Cancelar", use_container_width=True)
+        col_imp, col_duv = st.columns(2)
+        with col_imp:
+            is_impedimento = st.checkbox("🚧 É um impedimento?", key="add_is_impedimento")
+        with col_duv:
+            is_duvida = st.checkbox("❓ É uma dúvida?", key="add_is_duvida")
 
-            if btn_save:
-                erros = validar_formulario_atividade(description, effort_hours)
-                if erros:
-                    for erro in erros:
-                        st.error(erro)
-                else:
-                    st.session_state.pending_data = {
-                        'date': str(log_date), 'proj': project, 'cat': category, 'desc': description, 'eff': effort_hours
-                    }
-                    st.session_state.confirm_state = 'save_add'
-                    st.rerun()
-            if btn_canc:
-                st.session_state.confirm_state = 'cancel_add'
+        col_save, col_canc = st.columns(2)
+        with col_save:
+            btn_save = st.button("Salvar Registro", type="primary", use_container_width=True, key="add_btn_save")
+        with col_canc:
+            btn_canc = st.button("Cancelar", use_container_width=True, key="add_btn_canc")
+
+        if btn_save:
+            erros = validar_formulario_atividade(description, effort_hours)
+            if not project:
+                erros.append("Selecione um **Projeto** ou digite e confirme um nome novo.")
+            if not category:
+                erros.append("Selecione uma **Categoria** ou digite e confirme um nome novo.")
+            if erros:
+                for erro in erros:
+                    st.error(erro)
+            else:
+                st.session_state.pending_data = {
+                    'date': str(log_date), 'proj': project, 'cat': category, 'desc': description, 'eff': effort_hours,
+                    'imp': is_impedimento, 'duv': is_duvida,
+                }
+                st.session_state.confirm_state = 'save_add'
                 st.rerun()
+        if btn_canc:
+            st.session_state.confirm_state = 'cancel_add'
+            st.rerun()
 
     if st.session_state.view_state == 'edit' and st.session_state.target_id:
         st.header(f"Editar Registro (ID {st.session_state.target_id})")
-        st.caption("Todos os campos abaixo são obrigatórios.")
+        st.caption(
+            "Todos os campos abaixo são obrigatórios. Em Projeto/Categoria, escolha "
+            "\"➕ Criar novo...\" para digitar (e já criar) um nome novo na hora."
+        )
         df_target = repo.get_all_logs_as_dataframe()
         target_row = df_target[df_target['id'] == st.session_state.target_id].iloc[0]
+        # O PORQUE: assim como no "Novo Registro", este bloco não usa st.form
+        # para permitir que os dropdowns de Projeto/Categoria reajam na hora
+        # a "Criar novo...". As chaves dos widgets incluem o target_id para
+        # não herdar a seleção deixada pela edição de um registro anterior.
+        edit_key_suffix = st.session_state.target_id
 
-        with st.form("edit_form"):
-            col_d, col_p, col_c, col_e = st.columns(4)
-            with col_d:
-                parsed_date = datetime.strptime(target_row["log_date"], "%Y-%m-%d").date()
-                log_date = st.date_input("Data (DD/MM/AAAA)", value=parsed_date, format="DD/MM/YYYY")
-            with col_p:
-                p_opts = ["Sustentacao", "Passaporte", "360", "Job Boards", "Vagas", "Motor RCE", "Price Up", "Outros"]
-                p_idx = p_opts.index(target_row["project"]) if target_row["project"] in p_opts else 0
-                project = st.selectbox("Projeto", p_opts, index=p_idx)
-            with col_c:
-                c_opts = ["Desenvolvimento de Testes", "Execucao de Testes", "Documentacao", "Reuniao", "Resolucao de BUG/Problema", "Estudos/Certificacao"]
-                c_idx = c_opts.index(target_row["category"]) if target_row["category"] in c_opts else 0
-                category = st.selectbox("Categoria", c_opts, index=c_idx)
-            with col_e:
-                effort_hours = st.number_input("Esforço (Horas)", min_value=0.0, step=0.5, value=float(target_row["effort_hours"]))
+        col_d, col_p, col_c, col_e = st.columns(4)
+        with col_d:
+            parsed_date = datetime.strptime(target_row["log_date"], "%Y-%m-%d").date()
+            log_date = st.date_input("Data (DD/MM/AAAA)", value=parsed_date, format="DD/MM/YYYY", key=f"edit_log_date_{edit_key_suffix}")
+        with col_p:
+            project = creatable_option_picker(
+                "Projeto", "project", get_project_options,
+                key_prefix=f"edit_proj_{edit_key_suffix}", current_value=target_row["project"],
+            )
+        with col_c:
+            category = creatable_option_picker(
+                "Categoria", "category", get_category_options,
+                key_prefix=f"edit_cat_{edit_key_suffix}", current_value=target_row["category"],
+            )
+        with col_e:
+            effort_hours = st.number_input(
+                "Esforço (Horas)", min_value=0.0, step=0.5, value=float(target_row["effort_hours"]),
+                key=f"edit_effort_{edit_key_suffix}",
+            )
 
-            description = st.text_area("Descrição da Atividade *", value=target_row["description"])
+        description = st.text_area("Descrição da Atividade *", value=target_row["description"], key=f"edit_description_{edit_key_suffix}")
 
-            col_save, col_canc = st.columns(2)
-            with col_save:
-                btn_save = st.form_submit_button("Salvar Alterações", type="primary", use_container_width=True)
-            with col_canc:
-                btn_canc = st.form_submit_button("Cancelar", use_container_width=True)
+        col_imp, col_duv = st.columns(2)
+        with col_imp:
+            is_impedimento = st.checkbox(
+                "🚧 É um impedimento?", value=bool(int(target_row.get("is_impedimento", 0) or 0)),
+                key=f"edit_is_impedimento_{edit_key_suffix}",
+            )
+        with col_duv:
+            is_duvida = st.checkbox(
+                "❓ É uma dúvida?", value=bool(int(target_row.get("is_duvida", 0) or 0)),
+                key=f"edit_is_duvida_{edit_key_suffix}",
+            )
 
-            if btn_save:
-                erros = validar_formulario_atividade(description, effort_hours)
-                if erros:
-                    for erro in erros:
-                        st.error(erro)
-                else:
-                    st.session_state.pending_data = {
-                        'date': str(log_date), 'proj': project, 'cat': category, 'desc': description, 'eff': effort_hours
-                    }
-                    st.session_state.confirm_state = 'save_edit'
-                    st.rerun()
-            if btn_canc:
-                st.session_state.confirm_state = 'cancel_edit'
+        col_save, col_canc = st.columns(2)
+        with col_save:
+            btn_save = st.button("Salvar Alterações", type="primary", use_container_width=True, key=f"edit_btn_save_{edit_key_suffix}")
+        with col_canc:
+            btn_canc = st.button("Cancelar", use_container_width=True, key=f"edit_btn_canc_{edit_key_suffix}")
+
+        if btn_save:
+            erros = validar_formulario_atividade(description, effort_hours)
+            if not project:
+                erros.append("Selecione um **Projeto** ou digite e confirme um nome novo.")
+            if not category:
+                erros.append("Selecione uma **Categoria** ou digite e confirme um nome novo.")
+            if erros:
+                for erro in erros:
+                    st.error(erro)
+            else:
+                st.session_state.pending_data = {
+                    'date': str(log_date), 'proj': project, 'cat': category, 'desc': description, 'eff': effort_hours,
+                    'imp': is_impedimento, 'duv': is_duvida,
+                }
+                st.session_state.confirm_state = 'save_edit'
                 st.rerun()
+        if btn_canc:
+            st.session_state.confirm_state = 'cancel_edit'
+            st.rerun()
 
 # ==========================================
-# TAB 2: DASHBOARD, RELATÓRIOS E EXPORTAÇÃO
+# TAB 2: DAILY SCRUM
+# ==========================================
+with tab_daily:
+    st.header("Resumo para a Daily")
+    st.caption(
+        "Gera um resumo do que você fez ontem e do que vai fazer hoje, "
+        "pronto para consultar durante a Daily."
+    )
+
+    col_d1, col_d2 = st.columns(2)
+    default_ontem = datetime.today().date() - timedelta(days=1)
+    default_hoje = datetime.today().date()
+    with col_d1:
+        d_ontem = st.date_input("Data Anterior (Ontem)", value=default_ontem, format="DD/MM/YYYY", key="daily_d_ontem")
+    with col_d2:
+        d_hoje = st.date_input("Data Atual (Hoje)", value=default_hoje, format="DD/MM/YYYY", key="daily_d_hoje")
+
+    # O PORQUE: Impedimentos/Dúvidas passam a ter uma sugestão automática,
+    # montada a partir dos registros do período acima que estiverem marcados
+    # com is_impedimento/is_duvida (via checkbox manual no formulário ou
+    # inferência automática na importação de arquivo). O botão é separado do
+    # "Processar Relatório" de propósito: assim você pode ajustar as datas,
+    # puxar a sugestão, editar à mão o que quiser, e só então gerar o resumo
+    # final -- sem perder o que já tinha digitado a cada rerun da tela.
+    _daily_txt_editing_lock = st.session_state.get("daily_txt_editing", False)
+    if _daily_txt_editing_lock:
+        st.warning("✏️ Finalize (salve) a edição do texto corrido abaixo para liberar os outros botões desta aba.")
+
+    if st.button("🔄 Atualizar sugestões da base de dados", disabled=_daily_txt_editing_lock):
+        df_all_suggestion = repo.get_all_logs_as_dataframe()
+        st.session_state["impedimentos_input"] = build_daily_suggestion(df_all_suggestion, d_ontem, d_hoje, "is_impedimento")
+        st.session_state["duvidas_input"] = build_daily_suggestion(df_all_suggestion, d_ontem, d_hoje, "is_duvida")
+        st.rerun()
+
+    if "impedimentos_input" not in st.session_state:
+        st.session_state["impedimentos_input"] = "Nenhum."
+    if "duvidas_input" not in st.session_state:
+        st.session_state["duvidas_input"] = "Nenhuma."
+
+    impedimentos = st.text_area(
+        "Impedimentos", key="impedimentos_input",
+        help="Puxado automaticamente dos registros marcados como 🚧 Impedimento no período acima. Edite livremente.",
+    )
+    duvidas = st.text_area(
+        "Dúvidas", key="duvidas_input",
+        help="Puxado automaticamente dos registros marcados como ❓ Dúvida no período acima. Edite livremente.",
+    )
+
+    gen_daily = st.button("Processar Relatório", type="primary", disabled=_daily_txt_editing_lock)
+
+    if gen_daily:
+        df_all_daily = repo.get_all_logs_as_dataframe()
+        if not df_all_daily.empty:
+            df_all_daily["log_date_dt"] = pd.to_datetime(df_all_daily["log_date"]).dt.date
+            df_ontem = df_all_daily[df_all_daily["log_date_dt"] == d_ontem]
+            df_hoje = df_all_daily[df_all_daily["log_date_dt"] == d_hoje]
+        else:
+            df_ontem = pd.DataFrame(columns=["project", "description", "effort_hours"])
+            df_hoje = pd.DataFrame(columns=["project", "description", "effort_hours"])
+
+        # Versão em texto puro, usada tanto no download quanto na cópia rápida.
+        report_txt = f"=== DAILY SCRUM ===\nData: {datetime.today().strftime('%d/%m/%Y')}\n\n"
+        report_txt += f"O QUE FIZ ONTEM ({d_ontem.strftime('%d/%m/%Y')}):\n"
+        if df_ontem.empty:
+            report_txt += "- Sem registros mapeados.\n"
+        else:
+            for _, row in df_ontem.iterrows():
+                report_txt += f"- [{row['project']}] {row['description']} ({row['effort_hours']}h)\n"
+        report_txt += f"\nO QUE FAREI HOJE ({d_hoje.strftime('%d/%m/%Y')}):\n"
+        if df_hoje.empty:
+            report_txt += "- Sem registros mapeados.\n"
+        else:
+            for _, row in df_hoje.iterrows():
+                report_txt += f"- [{row['project']}] {row['description']} ({row['effort_hours']}h)\n"
+        report_txt += f"\nIMPEDIMENTOS:\n- {impedimentos}\n"
+        report_txt += f"\nDÚVIDAS:\n- {duvidas}\n"
+
+        # O PORQUE: guardamos em session_state para o resumo não sumir da tela
+        # assim que o usuário interage com o botão de download (o Streamlit
+        # reexecuta o script nesse clique, e "gen_daily" voltaria a False já
+        # que o formulário não foi reenviado).
+        st.session_state.daily_report = {
+            "d_ontem": d_ontem,
+            "d_hoje": d_hoje,
+            "df_ontem": df_ontem,
+            "df_hoje": df_hoje,
+            "impedimentos": impedimentos,
+            "duvidas": duvidas,
+            "report_txt": report_txt,
+        }
+
+        # O PORQUE: um novo relatório processado sai do modo de edição (se
+        # estivesse ativo) e limpa qualquer rascunho/erro pendente de uma
+        # edição anterior, para não misturar edições de um resumo antigo com
+        # o resumo recém-gerado.
+        st.session_state["daily_txt_editing"] = False
+        st.session_state["daily_txt_save_error"] = False
+        st.session_state.pop("daily_txt_draft", None)
+
+    if st.session_state.daily_report:
+        rep = st.session_state.daily_report
+        st.markdown("---")
+        st.subheader("📋 Resumo para a Daily")
+        st.caption(f"Gerado em {datetime.today().strftime('%d/%m/%Y %H:%M')}")
+
+        with st.container(border=True):
+            st.markdown(f"**✅ O que fiz ontem** — {rep['d_ontem'].strftime('%d/%m/%Y')}")
+            if rep["df_ontem"].empty:
+                st.info("Sem registros mapeados.")
+            else:
+                for _, row in rep["df_ontem"].iterrows():
+                    st.markdown(f"- **[{row['project']}]** {row['description']}  `{row['effort_hours']}h`")
+
+        with st.container(border=True):
+            st.markdown(f"**🎯 O que farei hoje** — {rep['d_hoje'].strftime('%d/%m/%Y')}")
+            if rep["df_hoje"].empty:
+                st.info("Sem registros mapeados.")
+            else:
+                for _, row in rep["df_hoje"].iterrows():
+                    st.markdown(f"- **[{row['project']}]** {row['description']}  `{row['effort_hours']}h`")
+
+        col_imp, col_duv = st.columns(2)
+        with col_imp:
+            st.markdown("**🚧 Impedimentos**")
+            imp = rep["impedimentos"].strip()
+            if imp and imp.lower() not in ("nenhum.", "nenhum"):
+                st.warning(imp)
+            else:
+                st.success("Nenhum impedimento.")
+        with col_duv:
+            st.markdown("**❓ Dúvidas**")
+            duv = rep["duvidas"].strip()
+            if duv and duv.lower() not in ("nenhuma.", "nenhuma"):
+                st.warning(duv)
+            else:
+                st.success("Nenhuma dúvida.")
+
+        with st.expander("📄 Ver texto corrido (para copiar e colar)", expanded=True):
+            # O PORQUE: o texto corrido é obrigatório (não pode ficar em
+            # branco) e por padrão fica só para leitura -- edição só é
+            # possível clicando em "Editar", e só sai do modo de edição
+            # salvando (não existe "descartar", já que o campo é
+            # obrigatório e não teria para onde "voltar" em branco).
+            #
+            # As funções de callback (on_click) são a forma correta, segundo
+            # a própria documentação do Streamlit, de alterar o
+            # st.session_state de uma key ligada a um widget: o callback roda
+            # ANTES do script reexecutar do zero, ou seja, antes do widget
+            # ser instanciado novamente -- diferente de atribuir direto
+            # st.session_state[key] = valor no meio do script DEPOIS que o
+            # widget daquela key já foi desenhado no mesmo rerun (isso é o
+            # que causava o StreamlitAPIException reportado).
+            if "daily_txt_editing" not in st.session_state:
+                st.session_state["daily_txt_editing"] = False
+
+            def _start_editing_daily_txt():
+                st.session_state["daily_txt_draft"] = rep["report_txt"]
+                st.session_state["daily_txt_editing"] = True
+                st.session_state["daily_txt_save_error"] = False
+
+            def _save_daily_txt():
+                new_text = st.session_state.get("daily_txt_draft", "").strip()
+                if not new_text:
+                    # O PORQUE: campo obrigatório -- não salva e mantém o
+                    # modo de edição aberto, mostrando o erro no próximo rerun.
+                    st.session_state["daily_txt_save_error"] = True
+                else:
+                    # O PORQUE: rep é o mesmo dict guardado em
+                    # st.session_state.daily_report, então esta atribuição já
+                    # atualiza o relatório oficial usado pelo download abaixo.
+                    rep["report_txt"] = st.session_state["daily_txt_draft"]
+                    st.session_state["daily_txt_editing"] = False
+                    st.session_state["daily_txt_save_error"] = False
+
+            def _cancel_editing_daily_txt():
+                # O PORQUE: só sai do modo de edição e descarta o rascunho --
+                # como o campo é obrigatório, não há risco de "cancelar para
+                # um estado em branco": rep["report_txt"] (última versão
+                # salva) continua intacto e volta a ser exibido.
+                st.session_state["daily_txt_editing"] = False
+                st.session_state["daily_txt_save_error"] = False
+
+            editing = st.session_state["daily_txt_editing"]
+
+            if not editing:
+                st.text_area(
+                    "Copia rápida", value=rep["report_txt"], height=300,
+                    label_visibility="collapsed", disabled=True, key="daily_txt_view",
+                )
+                st.button(
+                    "✏️ Editar texto", key="btn_edit_daily_txt",
+                    on_click=_start_editing_daily_txt, use_container_width=True,
+                )
+            else:
+                st.text_area(
+                    "Copia rápida (editando)", key="daily_txt_draft", height=300,
+                    label_visibility="collapsed",
+                )
+                if st.session_state.get("daily_txt_save_error"):
+                    st.error("O texto não pode ficar em branco. Escreva algo antes de salvar.")
+                st.caption("✍️ Editando — salve para aplicar a mudança e liberar os outros botões da aba.")
+                col_save, col_cancel = st.columns(2)
+                with col_save:
+                    st.button(
+                        "💾 Salvar alterações", key="btn_save_daily_txt", type="primary",
+                        on_click=_save_daily_txt, use_container_width=True,
+                    )
+                with col_cancel:
+                    st.button(
+                        "🚫 Cancelar edição", key="btn_cancel_daily_txt",
+                        on_click=_cancel_editing_daily_txt, use_container_width=True,
+                    )
+
+        # O PORQUE: enquanto o texto corrido estiver em modo de edição, o
+        # download (e os outros botões da aba, travados lá em cima) ficam
+        # bloqueados -- o arquivo baixado nunca diverge do que está na tela
+        # sem uma decisão explícita do usuário (salvar).
+        pending_changes = st.session_state.get("daily_txt_editing", False)
+
+        st.markdown("---")
+        if pending_changes:
+            st.info("⚠️ Salve as alterações no texto corrido acima para liberar o download.")
+        st.download_button(
+            label="⬇️ Baixar Resumo da Daily (.txt)",
+            data=rep["report_txt"].encode("utf-8"),
+            file_name=f"daily_{datetime.today().strftime('%Y%m%d')}.txt",
+            mime="text/plain",
+            use_container_width=True,
+            type="primary",
+            disabled=pending_changes,
+        )
+
+# ==========================================
+# TAB 3: DASHBOARD, RELATÓRIOS E EXPORTAÇÃO
 # ==========================================
 with tab_dashboard:
     st.header("Seus Números")
@@ -559,31 +1254,9 @@ with tab_dashboard:
                     st.success(f"Período selecionado: {start_date.strftime('%d/%m/%Y')} a {end_date.strftime('%d/%m/%Y')}")
 
                     df_filtered["Data_PTBR"] = df_filtered["log_date_dt"].dt.strftime("%d/%m/%Y")
-                    df_display_dash = df_filtered[["id", "Data_PTBR", "project", "category", "description", "effort_hours"]]
+                    df_display_dash = df_filtered[["id", "Data_PTBR", "project", "category", "description", "effort_hours", "is_impedimento", "is_duvida"]]
 
                     st.dataframe(df_display_dash, use_container_width=True, hide_index=True)
-
-                    csv_buffer = StringIO()
-                    df_display_dash.to_csv(csv_buffer, index=False, sep=";")
-                    csv_data = csv_buffer.getvalue()
-
-                    report_text = f"RELATÓRIO DE ATIVIDADES - QA\nPeríodo: {start_date.strftime('%d/%m/%Y')} a {end_date.strftime('%d/%m/%Y')}\n\n"
-                    report_text += f"Total de Registros: {len(df_filtered)}\n"
-                    report_text += f"Total de Horas: {df_filtered['effort_hours'].sum()}h\n\n"
-                    report_text += "==== HORAS POR PROJETO ====\n"
-                    proj_summary = df_filtered.groupby("project")["effort_hours"].sum().reset_index()
-                    for _, row in proj_summary.iterrows():
-                        report_text += f" > {row['project']}: {row['effort_hours']}h\n"
-                    report_text += "\n==== DETALHAMENTO ====\n"
-                    for _, row in df_display_dash.iterrows():
-                        report_text += f"[{row['Data_PTBR']}] {row['project']} | {row['category']} \n  -> {row['description']} ({row['effort_hours']}h)\n\n"
-
-                    st.markdown("### Baixar seus Dados")
-                    c_down_csv, c_down_txt = st.columns(2)
-                    with c_down_csv:
-                        st.download_button(label="Baixar Planilha (.csv)", data=csv_data, file_name=f"extrato_qa_{start_date}_{end_date}.csv", mime="text/csv", use_container_width=True)
-                    with c_down_txt:
-                        st.download_button(label="Baixar Relatório (.txt)", data=report_text, file_name=f"relatorio_qa_{start_date}_{end_date}.txt", mime="text/plain", use_container_width=True)
 
                     # O PORQUE: Com ranges de data longos, o gráfico diário fica
                     # poluído (dezenas/centenas de pontos ilegíveis no eixo X).
@@ -602,6 +1275,13 @@ with tab_dashboard:
                         1: "Jan", 2: "Fev", 3: "Mar", 4: "Abr", 5: "Mai", 6: "Jun",
                         7: "Jul", 8: "Ago", 9: "Set", 10: "Out", 11: "Nov", 12: "Dez",
                     }
+
+                    # O PORQUE: PROJECT_COLORS/CATEGORY_COLORS só têm cor fixa
+                    # para os itens originais. Projetos/Categorias criados pela
+                    # sidebar entram aqui e ganham uma cor da paleta de reserva,
+                    # em vez de ficarem sem cor definida nos gráficos abaixo.
+                    dynamic_project_colors = build_color_map(PROJECT_COLORS, df_filtered["project"].unique())
+                    dynamic_category_colors = build_color_map(CATEGORY_COLORS, df_filtered["category"].unique())
 
                     if is_monthly_view:
                         df_filtered["period_start"] = df_filtered["log_date_dt"].values.astype("datetime64[M]")
@@ -643,7 +1323,7 @@ with tab_dashboard:
                         )
                         fig_time = px.bar(
                             df_bar_grouped, x="period_label", y="effort_hours", color="project",
-                            title=f"Alocação de Esforço {chart_title_suffix}", color_discrete_map=PROJECT_COLORS,
+                            title=f"Alocação de Esforço {chart_title_suffix}", color_discrete_map=dynamic_project_colors,
                             labels={"period_label": period_axis_title, "effort_hours": "Horas", "project": "Projeto"},
                         )
                         fig_time.update_xaxes(
@@ -655,7 +1335,7 @@ with tab_dashboard:
                         df_grouped_cat = df_filtered.groupby("category")["effort_hours"].sum().reset_index()
                         fig_cat = px.pie(
                             df_grouped_cat, values="effort_hours", names="category", color="category",
-                            title="Horas por Área de Atuação", hole=0.4, color_discrete_map=CATEGORY_COLORS,
+                            title="Horas por Área de Atuação", hole=0.4, color_discrete_map=dynamic_category_colors,
                         )
                         st.plotly_chart(fig_cat, use_container_width=True)
 
@@ -679,7 +1359,7 @@ with tab_dashboard:
                             df_daily, x="period_label", y="effort_hours", color="project",
                             markers=True, title=f"Evolução Temporal do Esforço (Horas/{line_title_suffix})",
                             labels={"period_label": period_axis_title, "effort_hours": "Horas", "project": "Projeto"},
-                            color_discrete_map=PROJECT_COLORS,
+                            color_discrete_map=dynamic_project_colors,
                         )
                         fig_line.update_xaxes(
                             type="category", categoryorder="array",
@@ -782,7 +1462,7 @@ with tab_dashboard:
                             horizontal=True, key="pareto_dimension",
                         )
                         pareto_dim_col = "category" if pareto_dim_label == "Categoria" else "project"
-                        pareto_color_map = CATEGORY_COLORS if pareto_dim_label == "Categoria" else PROJECT_COLORS
+                        pareto_color_map = dynamic_category_colors if pareto_dim_label == "Categoria" else dynamic_project_colors
 
                         df_pareto = (
                             df_filtered.groupby(pareto_dim_col)["effort_hours"]
@@ -819,8 +1499,56 @@ with tab_dashboard:
                         fig_pareto.update_layout(title=f"Pareto de Esforço por {pareto_dim_label}", legend=dict(orientation="h", y=-0.2))
                         st.plotly_chart(fig_pareto, use_container_width=True)
 
+                    # O PORQUE: a exportação fica ao final da página, depois de
+                    # todos os gráficos, para o usuário primeiro enxergar a
+                    # análise visual e só então, se quiser, baixar os dados brutos.
+                    st.markdown("---")
+                    st.markdown("### Baixar seus Dados")
+
+                    # O PORQUE do bug do "x10" (1 virava 10, 2 virava 20): o to_csv
+                    # original usava sep=";" mas NAO especificava decimal=",",
+                    # entao effort_hours saia com ponto decimal (ex: "1.0"). Com
+                    # sep=";" (convencao pt-BR) porem decimal="." (ponto), o Excel
+                    # configurado em pt-BR pode interpretar esse ponto como
+                    # separador de MILHAR (nao decimal) e descartar seu efeito,
+                    # virando "1.0" -> 10. A correcao e explicitar decimal=",", que
+                    # e o que o Excel pt-BR realmente espera para casar com o
+                    # separador de coluna ";". A linha "sep=;" no topo do arquivo
+                    # e uma diretiva que o proprio Excel respeita independente da
+                    # configuracao regional, evitando tambem problema de coluna.
+                    csv_buffer = StringIO()
+                    df_display_dash.to_csv(csv_buffer, index=False, sep=";", decimal=",")
+                    csv_data = ("sep=;\n" + csv_buffer.getvalue()).encode("utf-8-sig")
+
+                    report_text = f"RELATÓRIO DE ATIVIDADES\nPeríodo: {start_date.strftime('%d/%m/%Y')} a {end_date.strftime('%d/%m/%Y')}\n\n"
+                    report_text += f"Total de Registros: {len(df_filtered)}\n"
+                    report_text += f"Total de Horas: {df_filtered['effort_hours'].sum()}h\n\n"
+                    report_text += "==== HORAS POR PROJETO ====\n"
+                    proj_summary = df_filtered.groupby("project")["effort_hours"].sum().reset_index()
+                    for _, row in proj_summary.iterrows():
+                        report_text += f" > {row['project']}: {row['effort_hours']}h\n"
+                    report_text += "\n==== DETALHAMENTO ====\n"
+                    for _, row in df_display_dash.iterrows():
+                        flag_prefix = ""
+                        if bool(int(row.get("is_impedimento", 0) or 0)):
+                            flag_prefix += "[IMPEDIMENTO] "
+                        if bool(int(row.get("is_duvida", 0) or 0)):
+                            flag_prefix += "[DÚVIDA] "
+                        report_text += f"[{row['Data_PTBR']}] {row['project']} | {row['category']} \n  -> {flag_prefix}{row['description']} ({row['effort_hours']}h)\n\n"
+
+                    c_down_csv, c_down_txt = st.columns(2)
+                    with c_down_csv:
+                        st.download_button(label="Baixar Planilha (.csv)", data=csv_data, file_name=f"extrato_atividades_{start_date}_{end_date}.csv", mime="text/csv", use_container_width=True)
+                    with c_down_txt:
+                        st.download_button(label="Baixar Relatório (.txt)", data=report_text, file_name=f"relatorio_atividades_{start_date}_{end_date}.txt", mime="text/plain", use_container_width=True)
+                    st.caption(
+                        "Se algum número aparecer errado ao abrir a planilha no Excel, use "
+                        "Dados > Obter Dados > De Texto/CSV (em vez de dar duplo-clique no arquivo) "
+                        "e confirme ';' como separador de coluna e ',' como separador decimal."
+                    )
+
 # ==========================================
-# TAB 3: SINCRONIZAÇÃO E OVERRIDE DE ARQUIVO
+# TAB 4: SINCRONIZAÇÃO E OVERRIDE DE ARQUIVO
 # ==========================================
 @st.dialog("Cancelar sincronização")
 def dialog_confirmar_cancelamento_sync():
@@ -845,46 +1573,82 @@ with tab_sync:
         dialog_confirmar_cancelamento_sync()
 
     st.header("Sincronizar Arquivo de Histórico")
-    st.info("Envie o arquivo de histórico (.txt) para comparar com os registros já salvos. Você poderá escolher, um a um, o que aplicar. No final, vamos pedir que você digite o nome do arquivo enviado para confirmar a operação.")
+    st.info("Envie o arquivo de histórico (.txt ou .csv) para comparar com os registros já salvos. Você poderá escolher, um a um, o que aplicar. No final, vamos pedir que você digite o nome do arquivo enviado para confirmar a operação.")
 
     # O PORQUE: Upload em memória (UploadedFile) substitui a leitura fixa de
     # "raw_history.txt" na raiz do projeto. Isso permite sincronizar a partir
     # de qualquer máquina/pasta, sem depender do arquivo estar no diretório
-    # de execução do Streamlit.
+    # de execução do Streamlit. Aceita tanto o formato de log em .txt quanto
+    # um .csv já estruturado nas colunas log_date;project;category;description;effort_hours.
     st.caption(f"Tamanho máximo permitido: {MAX_UPLOAD_SIZE_MB}MB.")
-    uploaded_txt = st.file_uploader("Arquivo de histórico (.txt)", type=["txt"], key="sync_uploader")
+    uploaded_file = st.file_uploader(
+        "Arquivo de histórico (.txt ou .csv)",
+        type=["txt", "csv"],
+        key="sync_uploader",
+        help=(
+            "Arquivos .txt seguem o formato de log manual (datas + tarefas, uma por linha). "
+            "Arquivos .csv devem ter as colunas log_date;project;category;description;effort_hours "
+            "(separador ';' e decimal ',' -- padrão pt-BR -- ou separador ',' e decimal '.' -- padrão US; "
+            "datas em dd/mm/aaaa ou aaaa-mm-dd)."
+        ),
+    )
 
     upload_too_large = False
-    if uploaded_txt is not None and uploaded_txt.size > MAX_UPLOAD_SIZE_BYTES:
+    if uploaded_file is not None and uploaded_file.size > MAX_UPLOAD_SIZE_BYTES:
         upload_too_large = True
-        uploaded_size_mb = uploaded_txt.size / (1024 * 1024)
+        uploaded_size_mb = uploaded_file.size / (1024 * 1024)
         st.error(
-            f"Arquivo '{uploaded_txt.name}' tem {uploaded_size_mb:.1f}MB, "
+            f"Arquivo '{uploaded_file.name}' tem {uploaded_size_mb:.1f}MB, "
             f"acima do limite de {MAX_UPLOAD_SIZE_MB}MB. Envie um arquivo menor."
         )
 
-    if st.button("Analisar Arquivo Enviado", type="primary", disabled=(uploaded_txt is None or upload_too_large)):
+    if st.button("Analisar Arquivo Enviado", type="primary", disabled=(uploaded_file is None or upload_too_large)):
         with st.spinner("Comparando com os registros salvos..."):
-            raw_text = uploaded_txt.read().decode("utf-8", errors="replace")
+            raw_bytes = uploaded_file.read()
+            file_ext = os.path.splitext(uploaded_file.name)[1].lower()
             parser = HistoryParser()
-            df_txt = parser.parse_text(raw_text)
+
+            if file_ext == ".csv":
+                df_txt = parser.parse_csv(raw_bytes)
+                if df_txt.empty:
+                    st.error(
+                        "Não foi possível reconhecer as colunas do CSV. Esperado: "
+                        "log_date;project;category;description;effort_hours "
+                        "(ou separado por vírgula, no padrão US)."
+                    )
+            else:
+                raw_text = raw_bytes.decode("utf-8", errors="replace")
+                df_txt = parser.parse_text(raw_text)
+
             df_db = repo.get_all_logs_as_dataframe()
+
+            # O PORQUE: normaliza is_impedimento/is_duvida para o mesmo tipo
+            # (int 0/1) dos dois lados antes do merge -- df_db vem do SQLite
+            # como int64, df_txt vem do parser como bool. Se os dtypes não
+            # baterem, o merge por essas colunas nunca dá match e todo
+            # registro pareceria "novo", mesmo já existindo.
+            COMPARE_COLUMNS = ["log_date", "project", "category", "description", "effort_hours", "is_impedimento", "is_duvida"]
+            if not df_txt.empty:
+                df_txt["is_impedimento"] = df_txt["is_impedimento"].astype(int)
+                df_txt["is_duvida"] = df_txt["is_duvida"].astype(int)
 
             # O PORQUE: Manipulação via Pandas Merge para identificar Deltas (Insertions vs Deletions) mantendo a performance de O(N).
             if not df_db.empty:
                 df_db_comp = df_db.drop(columns=["id", "created_at"])
+                df_db_comp["is_impedimento"] = df_db_comp["is_impedimento"].astype(int)
+                df_db_comp["is_duvida"] = df_db_comp["is_duvida"].astype(int)
             else:
-                df_db_comp = pd.DataFrame(columns=["log_date", "project", "category", "description", "effort_hours"])
+                df_db_comp = pd.DataFrame(columns=COMPARE_COLUMNS)
 
             if not df_txt.empty:
-                df_merged = df_txt.merge(df_db_comp, on=["log_date", "project", "category", "description", "effort_hours"], how='outer', indicator=True)
+                df_merged = df_txt.merge(df_db_comp, on=COMPARE_COLUMNS, how='outer', indicator=True)
 
                 df_to_insert = df_merged[df_merged['_merge'] == 'left_only'].drop(columns=['_merge']).copy()
                 df_to_delete_comp = df_merged[df_merged['_merge'] == 'right_only'].drop(columns=['_merge']).copy()
 
                 # Recupera os IDs para remoção exata
                 if not df_to_delete_comp.empty:
-                    df_to_delete = df_db.merge(df_to_delete_comp, on=["log_date", "project", "category", "description", "effort_hours"], how='inner')
+                    df_to_delete = df_db.merge(df_to_delete_comp, on=COMPARE_COLUMNS, how='inner')
                 else:
                     df_to_delete = pd.DataFrame()
             else:
@@ -899,7 +1663,7 @@ with tab_sync:
             st.session_state.df_to_insert = df_to_insert
             st.session_state.df_to_delete = df_to_delete
             st.session_state.sync_analyzed = True
-            st.session_state.sync_file_name = uploaded_txt.name
+            st.session_state.sync_file_name = uploaded_file.name
 
     if st.session_state.sync_analyzed:
         st.markdown("---")
@@ -923,8 +1687,10 @@ with tab_sync:
                     column_config={
                         "_Aplicar": st.column_config.CheckboxColumn("Aplicar", default=True),
                         "log_date": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
+                        "is_impedimento": st.column_config.CheckboxColumn("🚧 Impedimento"),
+                        "is_duvida": st.column_config.CheckboxColumn("❓ Dúvida"),
                     },
-                    disabled=["log_date", "project", "category", "description", "effort_hours"],
+                    disabled=["log_date", "project", "category", "description", "effort_hours", "is_impedimento", "is_duvida"],
                     hide_index=True,
                     use_container_width=True,
                     key="editor_insert"
@@ -941,8 +1707,10 @@ with tab_sync:
                     column_config={
                         "_Aplicar": st.column_config.CheckboxColumn("Excluir", default=True),
                         "log_date": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
+                        "is_impedimento": st.column_config.CheckboxColumn("🚧 Impedimento"),
+                        "is_duvida": st.column_config.CheckboxColumn("❓ Dúvida"),
                     },
-                    disabled=["id", "log_date", "project", "category", "description", "effort_hours", "created_at"],
+                    disabled=["id", "log_date", "project", "category", "description", "effort_hours", "created_at", "is_impedimento", "is_duvida"],
                     hide_index=True,
                     use_container_width=True,
                     key="editor_delete"
@@ -977,7 +1745,10 @@ with tab_sync:
                         # normalizamos para ISO (YYYY-MM-DD) antes de gravar, que é
                         # o formato esperado pela coluna log_date no SQLite.
                         log_date_iso = row["log_date"].strftime("%Y-%m-%d") if hasattr(row["log_date"], "strftime") else str(row["log_date"])
-                        repo.insert_log(log_date_iso, row["project"], row["category"], row["description"], row["effort_hours"])
+                        repo.insert_log(
+                            log_date_iso, row["project"], row["category"], row["description"], row["effort_hours"],
+                            bool(row.get("is_impedimento", False)), bool(row.get("is_duvida", False)),
+                        )
                         records_inserted += 1
 
                 if not edited_delete.empty:
