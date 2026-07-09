@@ -1,11 +1,44 @@
+import os
 import sqlite3
 import pandas as pd
+
+# O PORQUE: por padrão, o app roda contra um arquivo SQLite local
+# (personal_tracker.db). Isso não funciona no Streamlit Community Cloud,
+# porque o armazenamento local de lá NÃO é garantido entre "sonos"/deploys
+# (a própria documentação do Streamlit avisa que os arquivos locais podem
+# ser apagados a qualquer momento). Por isso, o banco "de verdade" passa a
+# viver no Turso (banco compatível com SQLite, hospedado na nuvem, com
+# camada gratuita). Se as variáveis TURSO_DATABASE_URL e TURSO_AUTH_TOKEN
+# existirem (via .streamlit/secrets.toml local, ou via "Secrets" no painel
+# do Community Cloud -- o Streamlit expõe as chaves de nível raiz do
+# secrets.toml também como variável de ambiente), conecta no Turso. Caso
+# contrário, cai para o arquivo SQLite local -- útil para rodar/testar 100%
+# offline, sem precisar de conta no Turso.
+TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL")
+TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
+
+# O PORQUE: usado como fallback caso o cursor devolvido pela conexão não
+# exponha `.description` (esperado tanto em sqlite3 quanto no driver do
+# Turso, mas mantemos uma rede de segurança para não quebrar o app caso um
+# dos dois se comporte de forma inesperada).
+WORK_LOGS_COLUMNS = [
+    "id", "log_date", "project", "category", "description",
+    "effort_hours", "created_at", "is_impedimento", "is_duvida",
+]
+
 
 class DatabaseConnection:
     def __init__(self, db_name: str = "personal_tracker.db"):
         self.db_name = db_name
 
-    def get_connection(self) -> sqlite3.Connection:
+    def get_connection(self):
+        if TURSO_DATABASE_URL and TURSO_AUTH_TOKEN:
+            # O PORQUE: import feito aqui dentro (e não no topo do arquivo)
+            # para o app continuar funcionando 100% localmente mesmo em uma
+            # máquina sem o pacote `libsql` instalado, contanto que as
+            # variáveis do Turso não estejam configuradas.
+            import libsql
+            return libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
         return sqlite3.connect(self.db_name, check_same_thread=False)
 
 class LogRepository:
@@ -67,6 +100,11 @@ class LogRepository:
         # O PORQUE: retorna False (em vez de deixar estourar exceção) quando o
         # valor já existe (UNIQUE constraint), para a UI mostrar um aviso
         # amigável em vez de travar a tela com um traceback do SQLite.
+        # Checamos o TEXTO da mensagem de erro (padrão herdado do SQLite,
+        # "UNIQUE constraint failed...") em vez do tipo exato da exceção,
+        # porque o driver do Turso (libsql) pode levantar uma classe de
+        # exceção diferente de sqlite3.IntegrityError para a mesma violação
+        # -- assim o comportamento fica igual nos dois bancos.
         value = value.strip()
         if not value:
             return False
@@ -77,8 +115,10 @@ class LogRepository:
             )
             self.conn.commit()
             return True
-        except sqlite3.IntegrityError:
-            return False
+        except Exception as e:
+            if "UNIQUE" in str(e).upper():
+                return False
+            raise
 
     def delete_custom_option(self, option_type: str, value: str):
         self.conn.execute(
@@ -113,9 +153,14 @@ class LogRepository:
             )
             self.conn.commit()
             return True
-        except sqlite3.IntegrityError:
-            self.conn.rollback()
-            return False
+        except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            if "UNIQUE" in str(e).upper():
+                return False
+            raise
 
     def insert_log(self, log_date: str, project: str, category: str, description: str, effort_hours: float,
                     is_impedimento: bool = False, is_duvida: bool = False):
@@ -138,4 +183,16 @@ class LogRepository:
         self.conn.commit()
 
     def get_all_logs_as_dataframe(self) -> pd.DataFrame:
-        return pd.read_sql_query("SELECT * FROM work_logs ORDER BY log_date DESC", self.conn)
+        # O PORQUE: pd.read_sql_query() detecta internamente se `con` é uma
+        # sqlite3.Connection para decidir como ler os resultados; um driver
+        # diferente (como o do Turso) pode não ser reconhecido do mesmo jeito.
+        # Montar o DataFrame manualmente a partir do cursor (fetchall +
+        # description) funciona igual nos dois bancos.
+        cursor = self.conn.execute("SELECT * FROM work_logs ORDER BY log_date DESC")
+        rows = cursor.fetchall()
+        try:
+            columns = [d[0] for d in cursor.description]
+        except Exception:
+            columns = WORK_LOGS_COLUMNS
+        return pd.DataFrame(rows, columns=columns)
+

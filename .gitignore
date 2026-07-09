@@ -8,9 +8,26 @@ dist/
 # Ignora todos os arquivos com uma extensão específica
 *.log
 *.db
-
-# Ignora arquivos pycache e diretórios __pycache__
-__pycache__/
+*.zip
+v2_online/
 
 # Ignora arquivos específicos
 raw_history.txt
+
+# O PORQUE: o secrets.toml de verdade tem suas credenciais do Turso -- se
+# fosse commitado, qualquer pessoa com acesso ao repositório (mesmo privado,
+# dependendo de quem tem acesso) poderia ler/escrever no seu banco. No
+# Community Cloud, os segredos são colados diretamente no painel do app
+# (Advanced settings > Secrets), não vêm do repositório.
+.streamlit/secrets.toml
+
+# O PORQUE: depois da migração para o Turso, o arquivo local deixa de ser a
+# fonte de dados de verdade. Mantê-lo fora do git evita confusão (alguém
+# baixar o repo e achar que esses dados ainda são usados pelo app).
+personal_tracker.db
+*.db-journal
+
+__pycache__/
+*.pyc
+.venv/
+venv/
