@@ -1,44 +1,35 @@
 import os
 import sqlite3
 import pandas as pd
+import sys
 
-# O PORQUE: por padrão, o app roda contra um arquivo SQLite local
-# (personal_tracker.db). Isso não funciona no Streamlit Community Cloud,
-# porque o armazenamento local de lá NÃO é garantido entre "sonos"/deploys
-# (a própria documentação do Streamlit avisa que os arquivos locais podem
-# ser apagados a qualquer momento). Por isso, o banco "de verdade" passa a
-# viver no Turso (banco compatível com SQLite, hospedado na nuvem, com
-# camada gratuita). Se as variáveis TURSO_DATABASE_URL e TURSO_AUTH_TOKEN
-# existirem (via .streamlit/secrets.toml local, ou via "Secrets" no painel
-# do Community Cloud -- o Streamlit expõe as chaves de nível raiz do
-# secrets.toml também como variável de ambiente), conecta no Turso. Caso
-# contrário, cai para o arquivo SQLite local -- útil para rodar/testar 100%
-# offline, sem precisar de conta no Turso.
+# O PORQUE: Definição de credenciais via variáveis de ambiente.
+# No Streamlit Cloud, estas serão lidas das 'Secrets'. No Windows local,
+# caso não existam, o app tentará usar o sqlite3 local.
 TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL")
 TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 
-# O PORQUE: usado como fallback caso o cursor devolvido pela conexão não
-# exponha `.description` (esperado tanto em sqlite3 quanto no driver do
-# Turso, mas mantemos uma rede de segurança para não quebrar o app caso um
-# dos dois se comporte de forma inesperada).
 WORK_LOGS_COLUMNS = [
     "id", "log_date", "project", "category", "description",
     "effort_hours", "created_at", "is_impedimento", "is_duvida",
 ]
-
 
 class DatabaseConnection:
     def __init__(self, db_name: str = "personal_tracker.db"):
         self.db_name = db_name
 
     def get_connection(self):
+        # Tenta conectar ao Turso se as credenciais estiverem presentes
         if TURSO_DATABASE_URL and TURSO_AUTH_TOKEN:
-            # O PORQUE: import feito aqui dentro (e não no topo do arquivo)
-            # para o app continuar funcionando 100% localmente mesmo em uma
-            # máquina sem o pacote `libsql` instalado, contanto que as
-            # variáveis do Turso não estejam configuradas.
-            import libsql
-            return libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+            try:
+                import libsql
+                return libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+            except ImportError:
+                print("AVISO: Driver 'libsql' não instalado. Ignorando Turso e usando banco local.", file=sys.stderr)
+            except Exception as e:
+                print(f"ERRO: Falha ao conectar ao Turso: {e}. Usando banco local.", file=sys.stderr)
+        
+        # Fallback padrão para SQLite local
         return sqlite3.connect(self.db_name, check_same_thread=False)
 
 class LogRepository:
@@ -60,17 +51,9 @@ class LogRepository:
         """
         self.conn.execute(query)
 
-        # O PORQUE: bancos criados antes desta versão não têm as colunas
-        # abaixo. SQLite não suporta "ADD COLUMN IF NOT EXISTS", então
-        # checamos via PRAGMA table_info antes de tentar o ALTER TABLE --
-        # migração idempotente, segura de rodar toda vez que o app sobe.
         self._ensure_column("work_logs", "is_impedimento", "INTEGER DEFAULT 0")
         self._ensure_column("work_logs", "is_duvida", "INTEGER DEFAULT 0")
 
-        # O PORQUE: Projeto e Categoria eram listas fixas no código (app.py).
-        # Esta tabela guarda as opções criadas manualmente pelo usuário (ex.:
-        # "Backoffice", "Cockpit"), somadas às listas base já existentes, sem
-        # precisar alterar código para cada novo projeto/categoria.
         query_options = """
         CREATE TABLE IF NOT EXISTS custom_options (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,14 +80,6 @@ class LogRepository:
         return [r[0] for r in rows]
 
     def add_custom_option(self, option_type: str, value: str) -> bool:
-        # O PORQUE: retorna False (em vez de deixar estourar exceção) quando o
-        # valor já existe (UNIQUE constraint), para a UI mostrar um aviso
-        # amigável em vez de travar a tela com um traceback do SQLite.
-        # Checamos o TEXTO da mensagem de erro (padrão herdado do SQLite,
-        # "UNIQUE constraint failed...") em vez do tipo exato da exceção,
-        # porque o driver do Turso (libsql) pode levantar uma classe de
-        # exceção diferente de sqlite3.IntegrityError para a mesma violação
-        # -- assim o comportamento fica igual nos dois bancos.
         value = value.strip()
         if not value:
             return False
@@ -128,14 +103,6 @@ class LogRepository:
         self.conn.commit()
 
     def rename_custom_option(self, option_type: str, old_value: str, new_value: str) -> bool:
-        # O PORQUE: "editar" um Projeto/Categoria customizado precisa fazer
-        # duas coisas: (1) renomear a entrada em custom_options (para o
-        # dropdown passar a mostrar o novo nome) e (2) atualizar em cascata
-        # os work_logs que já usavam o nome antigo -- senão registros antigos
-        # "sumiriam" da visão do novo nome e o filtro do Dashboard ficaria
-        # inconsistente. Devolve False (sem levantar exceção) se o novo nome
-        # já existir (UNIQUE constraint) ou for igual/vazio, para a UI
-        # mostrar um aviso amigável em vez de travar com traceback.
         old_value = (old_value or "").strip()
         new_value = (new_value or "").strip()
         if not new_value or old_value == new_value:
@@ -183,11 +150,6 @@ class LogRepository:
         self.conn.commit()
 
     def get_all_logs_as_dataframe(self) -> pd.DataFrame:
-        # O PORQUE: pd.read_sql_query() detecta internamente se `con` é uma
-        # sqlite3.Connection para decidir como ler os resultados; um driver
-        # diferente (como o do Turso) pode não ser reconhecido do mesmo jeito.
-        # Montar o DataFrame manualmente a partir do cursor (fetchall +
-        # description) funciona igual nos dois bancos.
         cursor = self.conn.execute("SELECT * FROM work_logs ORDER BY log_date DESC")
         rows = cursor.fetchall()
         try:
@@ -195,4 +157,3 @@ class LogRepository:
         except Exception:
             columns = WORK_LOGS_COLUMNS
         return pd.DataFrame(rows, columns=columns)
-

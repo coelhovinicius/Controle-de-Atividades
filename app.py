@@ -7,12 +7,168 @@ import numpy as np
 import unicodedata
 import time
 import os
+import hmac
+import secrets as pysecrets
 from io import StringIO
 from datetime import datetime, timedelta
 from database_core import DatabaseConnection, LogRepository
 from importer_core import HistoryParser
 
 st.set_page_config(page_title="Task Tracker ", layout="wide", initial_sidebar_state="collapsed")
+
+# ==========================================
+# LOGIN
+# ==========================================
+# O PORQUE: o plano gratuito do Streamlit Community Cloud só permite 1 app
+# privado por conta, e essa cota já está em uso por outro app. Em vez de
+# depender do controle de acesso nativo do Streamlit (email convidado), o
+# app fica "Public" no Streamlit, e o controle de acesso de verdade é feito
+# aqui: nada do app roda (nem a conexão com o banco) até o login ser
+# validado contra usuário/senha configurados nos Secrets.
+#
+# Configuração esperada em .streamlit/secrets.toml (local) e em
+# Settings > Secrets (Community Cloud) -- veja secrets.toml.example:
+#   [credentials]
+#   "seu_usuario" = "sua_senha"
+#   "outro_usuario" = "outra_senha"
+
+# O PORQUE: st.session_state é por sessão de navegador e se perde ao
+# recarregar a página (F5) -- por isso, sozinho, não sustenta "ficar logado
+# até clicar em Sair". Este dicionário vive no nível do processo Python (não
+# dentro de session_state), sobrevive a reruns/reloads de qualquer aba
+# enquanto o servidor Streamlit continuar de pé, e guarda só um token
+# aleatório -> {usuário, validade} (nunca a senha). O token vai para a URL
+# (?s=...) para sobreviver a um F5; ao clicar em "Sair", o token é removido
+# daqui -- então mesmo quem tiver guardado aquele link antigo não consegue
+# mais entrar com ele.
+_ACTIVE_SESSIONS = {}
+SESSION_TTL_HOURS = 12
+
+
+def _criar_sessao(username: str) -> str:
+    token = pysecrets.token_urlsafe(32)
+    _ACTIVE_SESSIONS[token] = {
+        "username": username,
+        "expires_at": datetime.now() + timedelta(hours=SESSION_TTL_HOURS),
+    }
+    return token
+
+
+def _validar_sessao(token: str):
+    info = _ACTIVE_SESSIONS.get(token)
+    if not info:
+        return None
+    if datetime.now() > info["expires_at"]:
+        _ACTIVE_SESSIONS.pop(token, None)
+        return None
+    return info["username"]
+
+
+def _revogar_sessao(token: str):
+    _ACTIVE_SESSIONS.pop(token, None)
+
+
+def _validar_login(username: str, password: str) -> bool:
+    try:
+        credentials = st.secrets.get("credentials", {})
+    except Exception:
+        # O PORQUE: se .streamlit/secrets.toml ainda não existir (ex.: primeira
+        # vez rodando localmente antes de configurar), st.secrets pode levantar
+        # exceção em vez de simplesmente devolver vazio. Tratamos aqui para
+        # mostrar uma mensagem clara em vez de um traceback confuso.
+        credentials = {}
+
+    if not credentials:
+        st.error(
+            "Nenhuma credencial configurada em `[credentials]` no secrets.toml. "
+            "Veja `.streamlit/secrets.toml.example`."
+        )
+        return False
+
+    if not username or username not in credentials:
+        # O PORQUE: mesmo com usuário inexistente, ainda comparamos contra uma
+        # senha "vazia" via compare_digest (em vez de retornar False na hora)
+        # -- assim o tempo de resposta não denuncia se o usuário existe ou
+        # não (mitigação simples de timing attack).
+        hmac.compare_digest("", password or "")
+        return False
+    return hmac.compare_digest(str(credentials[username]), password or "")
+
+
+def _limpar_sessao_local(revogar: bool = True):
+    # O PORQUE: ao sair, apagamos TODO o session_state (não só a flag de
+    # login) -- pesquisas, filtros de data do Dashboard, dados de
+    # sincronização pendentes, edições em andamento, tudo. Assim, se outra
+    # pessoa logar em seguida no mesmo navegador, não encontra nenhum
+    # resquício da sessão anterior.
+    if revogar:
+        token = st.session_state.get("auth_token")
+        if token:
+            _revogar_sessao(token)
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    st.query_params.clear()
+    st.session_state.authenticated = False
+
+
+@st.dialog("Sair")
+def _dialog_confirmar_logout():
+    st.write("Tem certeza que deseja sair?")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Sim, sair", type="primary", use_container_width=True):
+            with st.spinner("Encerrando sessão..."):
+                _limpar_sessao_local()
+            st.rerun()
+    with col2:
+        if st.button("Cancelar", use_container_width=True):
+            st.rerun()
+
+
+def _tela_login():
+    st.write("")
+    st.write("")
+    col_a, col_b, col_c = st.columns([1, 1.1, 1])
+    with col_b:
+        st.title("📊 Task Tracker")
+        st.subheader("Acesso restrito")
+        with st.form("login_form"):
+            username = st.text_input("Usuário")
+            password = st.text_input("Senha", type="password")
+            entrar = st.form_submit_button("Entrar", type="primary", use_container_width=True)
+
+        if entrar:
+            with st.spinner("Verificando credenciais..."):
+                login_ok = _validar_login(username, password)
+            if login_ok:
+                token = _criar_sessao(username)
+                st.session_state.authenticated = True
+                st.session_state.auth_username = username
+                st.session_state.auth_token = token
+                st.query_params["s"] = token
+                st.rerun()
+            else:
+                st.error("Usuário ou senha incorretos.")
+
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+    # O PORQUE: primeira execução desta aba/sessão (ex.: acabou de dar F5).
+    # Antes de exigir login de novo, verifica se a URL já traz um token de
+    # uma sessão anterior ainda válida (?s=...) -- se validar, restaura o
+    # login automaticamente, sem pedir usuário/senha de novo.
+    qp_token = st.query_params.get("s")
+    if qp_token:
+        qp_username = _validar_sessao(qp_token)
+        if qp_username:
+            st.session_state.authenticated = True
+            st.session_state.auth_username = qp_username
+            st.session_state.auth_token = qp_token
+
+if not st.session_state.authenticated:
+    _tela_login()
+    st.stop()
 
 # O PORQUE: por padrão, o texto das abas do Streamlit sai pequeno e sem
 # destaque visual, dificultando a navegação. Este CSS aumenta o tamanho da
@@ -33,6 +189,49 @@ st.markdown(
     .stTabs [data-baseweb="tab-list"] button div {
         font-size: 1.5rem;
         font-weight: 700;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# O PORQUE: o Streamlit já mostra um indicador nativo (o "stStatusWidget",
+# um ícone pequeno no canto superior direito) enquanto o script está
+# rodando, mas ele é discreto e não impede visualmente o usuário de tentar
+# clicar em outra coisa enquanto isso. Este CSS: (1) deixa esse indicador
+# nativo bem mais visível, com texto "Carregando..."; (2) usa o seletor
+# :has() para desenhar um overlay escurecido cobrindo a tela inteira e
+# bloquear cliques (pointer-events: none) em TUDO enquanto esse indicador
+# estiver presente no DOM -- ou seja, enquanto o app estiver processando.
+# ATENÇÃO: :has() exige um navegador razoavelmente recente (Chrome/Edge 105+,
+# Firefox 121+); em navegadores muito antigos o overlay simplesmente não
+# aparece (mas o app continua funcionando normalmente, só sem o bloqueio
+# visual extra). Se o testid "stStatusWidget" mudar em versões futuras do
+# Streamlit, este seletor pode parar de funcionar -- nesse caso, confira no
+# DevTools (F12) qual testid o indicador de "running" usa na sua versão.
+st.markdown(
+    """
+    <style>
+    [data-testid="stStatusWidget"] {
+        transform: scale(1.6);
+        transform-origin: top right;
+    }
+    body:has([data-testid="stStatusWidget"]) {
+        cursor: progress;
+    }
+    body:has([data-testid="stStatusWidget"])::after {
+        content: "Carregando, aguarde...";
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.55);
+        color: white;
+        font-size: 1.8rem;
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 999999;
+        pointer-events: all;
     }
     </style>
     """,
@@ -647,6 +846,12 @@ def _manage_options_panel(label_singular: str, option_type: str, base_options: l
 
 
 with st.sidebar:
+    st.caption(f"Logado como **{st.session_state.get('auth_username', '')}**")
+    if st.button("🚪 Sair", use_container_width=True):
+        _dialog_confirmar_logout()
+    st.markdown("---")
+
+with st.sidebar:
     st.subheader("⚙️ Projetos e Categorias")
 
     with st.expander("📁 Novo Nome de Projeto"):
@@ -959,13 +1164,35 @@ with tab_daily:
         "pronto para consultar durante a Daily."
     )
 
-    col_d1, col_d2 = st.columns(2)
     default_ontem = datetime.today().date() - timedelta(days=1)
     default_hoje = datetime.today().date()
-    with col_d1:
-        d_ontem = st.date_input("Data Anterior (Ontem)", value=default_ontem, format="DD/MM/YYYY", key="daily_d_ontem")
-    with col_d2:
-        d_hoje = st.date_input("Data Atual (Hoje)", value=default_hoje, format="DD/MM/YYYY", key="daily_d_hoje")
+
+    # O PORQUE: mesmo padrão do filtro de período do Dashboard -- as duas
+    # datas ficam dentro de um st.form, então trocar "Ontem" ou "Hoje" não
+    # dispara nada sozinho. Só depois de clicar em "Aplicar Período" é que o
+    # valor escolhido passa a valer para as sugestões e para o relatório.
+    with st.form("daily_period_form"):
+        st.markdown("### Escolha o Período")
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            d_ontem_input = st.date_input("Data Anterior (Ontem)", value=default_ontem, format="DD/MM/YYYY", key="daily_d_ontem")
+        with col_d2:
+            d_hoje_input = st.date_input("Data Atual (Hoje)", value=default_hoje, format="DD/MM/YYYY", key="daily_d_hoje")
+        apply_daily_period = st.form_submit_button("Aplicar Período", type="primary")
+
+    if apply_daily_period:
+        st.session_state.daily_period_ontem = d_ontem_input
+        st.session_state.daily_period_hoje = d_hoje_input
+
+    if "daily_period_ontem" not in st.session_state:
+        st.session_state.daily_period_ontem = default_ontem
+    if "daily_period_hoje" not in st.session_state:
+        st.session_state.daily_period_hoje = default_hoje
+
+    d_ontem = st.session_state.daily_period_ontem
+    d_hoje = st.session_state.daily_period_hoje
+
+    st.caption(f"Período aplicado: Ontem = {d_ontem.strftime('%d/%m/%Y')} • Hoje = {d_hoje.strftime('%d/%m/%Y')}")
 
     # O PORQUE: Impedimentos/Dúvidas passam a ter uma sugestão automática,
     # montada a partir dos registros do período acima que estiverem marcados
@@ -978,10 +1205,36 @@ with tab_daily:
     if _daily_txt_editing_lock:
         st.warning("✏️ Finalize (salve) a edição do texto corrido abaixo para liberar os outros botões desta aba.")
 
+    def _merge_daily_suggestion(current_text: str, suggestion_text: str, empty_placeholder: str) -> str:
+        # O PORQUE: antes, "Atualizar sugestões da base de dados" SOBRESCREVIA
+        # por completo o que o usuário já tinha digitado à mão em
+        # Impedimentos/Dúvidas. Agora, cada linha já digitada manualmente é
+        # preservada, e só as linhas da sugestão automática que ainda não
+        # estão lá são adicionadas (sem duplicar). O placeholder padrão
+        # ("Nenhum."/"Nenhuma.") não conta como conteúdo real do usuário.
+        current_lines = [ln.strip() for ln in (current_text or "").strip().splitlines() if ln.strip()]
+        current_lines = [ln for ln in current_lines if ln.lower() != empty_placeholder.lower()]
+
+        suggestion_lines = [ln.strip() for ln in (suggestion_text or "").strip().splitlines() if ln.strip()]
+        suggestion_lines = [ln for ln in suggestion_lines if ln.lower() != empty_placeholder.lower()]
+
+        combined = list(current_lines)
+        for ln in suggestion_lines:
+            if ln not in combined:
+                combined.append(ln)
+
+        return "\n".join(combined) if combined else empty_placeholder
+
     if st.button("🔄 Atualizar sugestões da base de dados", disabled=_daily_txt_editing_lock):
         df_all_suggestion = repo.get_all_logs_as_dataframe()
-        st.session_state["impedimentos_input"] = build_daily_suggestion(df_all_suggestion, d_ontem, d_hoje, "is_impedimento")
-        st.session_state["duvidas_input"] = build_daily_suggestion(df_all_suggestion, d_ontem, d_hoje, "is_duvida")
+        new_imp_suggestion = build_daily_suggestion(df_all_suggestion, d_ontem, d_hoje, "is_impedimento")
+        new_duv_suggestion = build_daily_suggestion(df_all_suggestion, d_ontem, d_hoje, "is_duvida")
+        st.session_state["impedimentos_input"] = _merge_daily_suggestion(
+            st.session_state.get("impedimentos_input", ""), new_imp_suggestion, "Nenhum."
+        )
+        st.session_state["duvidas_input"] = _merge_daily_suggestion(
+            st.session_state.get("duvidas_input", ""), new_duv_suggestion, "Nenhuma."
+        )
         st.rerun()
 
     if "impedimentos_input" not in st.session_state:
@@ -997,6 +1250,19 @@ with tab_daily:
         "Dúvidas", key="duvidas_input",
         help="Puxado automaticamente dos registros marcados como ❓ Dúvida no período acima. Edite livremente.",
     )
+
+    def _format_bullets(text: str) -> str:
+        # O PORQUE: antes, só a 1ª linha de Impedimentos/Dúvidas ganhava o
+        # marcador "- " (era um único f"- {texto}" com o texto inteiro,
+        # inclusive multi-linha, embutido depois do marcador). Se o usuário
+        # digitasse mais de um item (uma por linha), as linhas seguintes
+        # ficavam sem marcador e "coladas" ao final -- dando a impressão de
+        # que o conteúdo tinha sumido no texto corrido, mesmo estando lá.
+        # Esta função garante que TODA linha não vazia vire seu próprio item.
+        lines = [ln.strip() for ln in (text or "").strip().splitlines() if ln.strip()]
+        if not lines:
+            return "- Nenhum registro informado."
+        return "\n".join(f"- {ln[1:].strip() if ln.startswith('-') else ln}" for ln in lines)
 
     gen_daily = st.button("Processar Relatório", type="primary", disabled=_daily_txt_editing_lock)
 
@@ -1024,8 +1290,8 @@ with tab_daily:
         else:
             for _, row in df_hoje.iterrows():
                 report_txt += f"- [{row['project']}] {row['description']} ({row['effort_hours']}h)\n"
-        report_txt += f"\nIMPEDIMENTOS:\n- {impedimentos}\n"
-        report_txt += f"\nDÚVIDAS:\n- {duvidas}\n"
+        report_txt += f"\nIMPEDIMENTOS:\n{_format_bullets(impedimentos)}\n"
+        report_txt += f"\nDÚVIDAS:\n{_format_bullets(duvidas)}\n"
 
         # O PORQUE: guardamos em session_state para o resumo não sumir da tela
         # assim que o usuário interage com o botão de download (o Streamlit
@@ -1136,8 +1402,16 @@ with tab_daily:
 
             if not editing:
                 st.text_area(
+                    # O PORQUE: aqui NÃO usamos "key" junto de "value" -- se
+                    # usássemos, o Streamlit só aplicaria "value" na primeira
+                    # vez que essa key aparecesse; nas próximas vezes ele
+                    # ignoraria o novo "value" e manteria travado o que já
+                    # estava salvo em session_state daquela key (era
+                    # exatamente o bug: o texto corrido ficava congelado no
+                    # primeiro "Nenhum."/"Nenhuma." gerado, mesmo depois de
+                    # reprocessar o relatório com dados novos).
                     "Copia rápida", value=rep["report_txt"], height=300,
-                    label_visibility="collapsed", disabled=True, key="daily_txt_view",
+                    label_visibility="collapsed", disabled=True,
                 )
                 st.button(
                     "✏️ Editar texto", key="btn_edit_daily_txt",

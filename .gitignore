@@ -13,6 +13,7 @@ v2_online/
 
 # Ignora arquivos específicos
 raw_history.txt
+TURSO_DEPLOY.txt
 
 # O PORQUE: o secrets.toml de verdade tem suas credenciais do Turso -- se
 # fosse commitado, qualquer pessoa com acesso ao repositório (mesmo privado,
