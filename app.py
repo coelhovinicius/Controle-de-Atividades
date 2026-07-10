@@ -310,15 +310,26 @@ def get_repository():
 repo = get_repository()
 
 
+def _current_user() -> str:
+    # O PORQUE: ponto único usado em toda consulta/gravação no banco para
+    # saber "de quem" são os dados. Se por algum motivo ainda não houver
+    # usuário autenticado neste ponto do código (não deveria acontecer, já
+    # que o app para em st.stop() antes do login), cai em string vazia em
+    # vez de None -- assim uma consulta "WHERE username = ''" não devolve
+    # os dados de ninguém, em vez de quebrar com um erro de tipo.
+    return st.session_state.get("auth_username") or ""
+
+
 def get_project_options() -> list:
     # O PORQUE: mantém "Outros" sempre por último (comportamento original),
-    # inserindo os projetos customizados logo antes dele.
-    custom = [p for p in repo.get_custom_options("project") if p not in BASE_PROJECT_OPTIONS]
+    # inserindo os projetos customizados logo antes dele. Cada usuário só vê
+    # (e só pode gerenciar) os projetos customizados que ele mesmo criou.
+    custom = [p for p in repo.get_custom_options("project", _current_user()) if p not in BASE_PROJECT_OPTIONS]
     return BASE_PROJECT_OPTIONS[:-1] + custom + [BASE_PROJECT_OPTIONS[-1]]
 
 
 def get_category_options() -> list:
-    custom = [c for c in repo.get_custom_options("category") if c not in BASE_CATEGORY_OPTIONS]
+    custom = [c for c in repo.get_custom_options("category", _current_user()) if c not in BASE_CATEGORY_OPTIONS]
     return BASE_CATEGORY_OPTIONS + custom
 
 
@@ -531,20 +542,21 @@ def render_pending_confirmation():
 def execute_processing_action(action: dict) -> bool:
     t = action["type"]
     p = action["payload"]
+    username = _current_user()
 
     if t == "add_custom_option":
-        ok = repo.add_custom_option(p["option_type"], p["value"])
+        ok = repo.add_custom_option(p["option_type"], username, p["value"])
         st.session_state[f"manage_{p['option_type']}_new"] = ""
         return ok
 
     elif t == "rename_custom_option":
-        ok = repo.rename_custom_option(p["option_type"], p["old_value"], p["new_value"])
+        ok = repo.rename_custom_option(p["option_type"], username, p["old_value"], p["new_value"])
         if ok:
             st.session_state[f"manage_{p['option_type']}_select"] = p["new_value"]
         return ok
 
     elif t == "delete_custom_option":
-        repo.delete_custom_option(p["option_type"], p["value"])
+        repo.delete_custom_option(p["option_type"], username, p["value"])
         # O PORQUE: o valor excluído não existe mais na lista de opções --
         # sem isso, o selectbox da sidebar (que guarda a seleção pela key)
         # tentaria reabrir com um valor inválido e quebraria.
@@ -552,7 +564,7 @@ def execute_processing_action(action: dict) -> bool:
         return True
 
     elif t == "add_custom_option_inline":
-        ok = repo.add_custom_option(p["option_type"], p["value"])
+        ok = repo.add_custom_option(p["option_type"], username, p["value"])
         if ok:
             st.session_state[p["select_key"]] = p["value"]
         st.session_state[p["text_key"]] = ""
@@ -560,18 +572,18 @@ def execute_processing_action(action: dict) -> bool:
 
     elif t == "insert_log":
         d = p
-        repo.insert_log(d['date'], d['proj'], d['cat'], d['desc'], d['eff'], d.get('imp', False), d.get('duv', False))
+        repo.insert_log(username, d['date'], d['proj'], d['cat'], d['desc'], d['eff'], d.get('imp', False), d.get('duv', False))
         reset_states(full_reset=True)
         return True
 
     elif t == "update_log":
         d = p
-        repo.update_log(d['target_id'], d['date'], d['proj'], d['cat'], d['desc'], d['eff'], d.get('imp', False), d.get('duv', False))
+        repo.update_log(d['target_id'], username, d['date'], d['proj'], d['cat'], d['desc'], d['eff'], d.get('imp', False), d.get('duv', False))
         reset_states(full_reset=True)
         return True
 
     elif t == "delete_log":
-        repo.delete_log(p["log_id"])
+        repo.delete_log(p["log_id"], username)
         reset_states(full_reset=True)
         return True
 
@@ -774,7 +786,7 @@ def _manage_options_panel(label_singular: str, option_type: str, base_options: l
     # mapa de cores fixo dos gráficos -- por isso ficam visíveis aqui para
     # consulta, mas só os customizados podem ser renomeados/excluídos.
     all_options = get_options_fn()
-    custom_options = repo.get_custom_options(option_type)
+    custom_options = repo.get_custom_options(option_type, _current_user())
 
     picked = st.selectbox(
         f"{label_singular}s cadastrados",
@@ -894,7 +906,7 @@ with tab_manage:
                 reset_states(full_reset=False)
                 st.rerun()
 
-        df_all = repo.get_all_logs_as_dataframe()
+        df_all = repo.get_all_logs_as_dataframe(_current_user())
 
         if df_all.empty:
             st.info("Você ainda não tem nenhum registro cadastrado. Clique em **Novo Registro** para começar.")
@@ -1086,7 +1098,7 @@ with tab_manage:
             "Todos os campos abaixo são obrigatórios. Em Projeto/Categoria, escolha "
             "\"➕ Criar novo...\" para digitar (e já criar) um nome novo na hora."
         )
-        df_target = repo.get_all_logs_as_dataframe()
+        df_target = repo.get_all_logs_as_dataframe(_current_user())
         target_row = df_target[df_target['id'] == st.session_state.target_id].iloc[0]
         # O PORQUE: assim como no "Novo Registro", este bloco não usa st.form
         # para permitir que os dropdowns de Projeto/Categoria reajam na hora
@@ -1226,7 +1238,7 @@ with tab_daily:
         return "\n".join(combined) if combined else empty_placeholder
 
     if st.button("🔄 Atualizar sugestões da base de dados", disabled=_daily_txt_editing_lock):
-        df_all_suggestion = repo.get_all_logs_as_dataframe()
+        df_all_suggestion = repo.get_all_logs_as_dataframe(_current_user())
         new_imp_suggestion = build_daily_suggestion(df_all_suggestion, d_ontem, d_hoje, "is_impedimento")
         new_duv_suggestion = build_daily_suggestion(df_all_suggestion, d_ontem, d_hoje, "is_duvida")
         st.session_state["impedimentos_input"] = _merge_daily_suggestion(
@@ -1267,7 +1279,7 @@ with tab_daily:
     gen_daily = st.button("Processar Relatório", type="primary", disabled=_daily_txt_editing_lock)
 
     if gen_daily:
-        df_all_daily = repo.get_all_logs_as_dataframe()
+        df_all_daily = repo.get_all_logs_as_dataframe(_current_user())
         if not df_all_daily.empty:
             df_all_daily["log_date_dt"] = pd.to_datetime(df_all_daily["log_date"]).dt.date
             df_ontem = df_all_daily[df_all_daily["log_date_dt"] == d_ontem]
@@ -1461,7 +1473,7 @@ with tab_daily:
 # ==========================================
 with tab_dashboard:
     st.header("Seus Números")
-    df_logs = repo.get_all_logs_as_dataframe()
+    df_logs = repo.get_all_logs_as_dataframe(_current_user())
 
     if df_logs.empty:
         st.info("Você ainda não tem nenhum registro cadastrado.")
@@ -1894,7 +1906,7 @@ with tab_sync:
                 raw_text = raw_bytes.decode("utf-8", errors="replace")
                 df_txt = parser.parse_text(raw_text)
 
-            df_db = repo.get_all_logs_as_dataframe()
+            df_db = repo.get_all_logs_as_dataframe(_current_user())
 
             # O PORQUE: normaliza is_impedimento/is_duvida para o mesmo tipo
             # (int 0/1) dos dois lados antes do merge -- df_db vem do SQLite
@@ -2013,6 +2025,7 @@ with tab_sync:
 
                 if not edited_insert.empty:
                     to_insert = edited_insert[edited_insert["_Aplicar"] == True]
+                    sync_username = _current_user()
                     for _, row in to_insert.iterrows():
                         # O PORQUE: DateColumn pode devolver datetime.date (ou
                         # Timestamp) em vez de string ao ler o data_editor de volta;
@@ -2020,15 +2033,16 @@ with tab_sync:
                         # o formato esperado pela coluna log_date no SQLite.
                         log_date_iso = row["log_date"].strftime("%Y-%m-%d") if hasattr(row["log_date"], "strftime") else str(row["log_date"])
                         repo.insert_log(
-                            log_date_iso, row["project"], row["category"], row["description"], row["effort_hours"],
+                            sync_username, log_date_iso, row["project"], row["category"], row["description"], row["effort_hours"],
                             bool(row.get("is_impedimento", False)), bool(row.get("is_duvida", False)),
                         )
                         records_inserted += 1
 
                 if not edited_delete.empty:
                     to_delete = edited_delete[edited_delete["_Aplicar"] == True]
+                    sync_username = _current_user()
                     for _, row in to_delete.iterrows():
-                        repo.delete_log(row["id"])
+                        repo.delete_log(row["id"], sync_username)
                         records_deleted += 1
 
                 st.session_state.sync_analyzed = False

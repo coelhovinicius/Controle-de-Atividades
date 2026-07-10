@@ -11,7 +11,7 @@ TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 
 WORK_LOGS_COLUMNS = [
     "id", "log_date", "project", "category", "description",
-    "effort_hours", "created_at", "is_impedimento", "is_duvida",
+    "effort_hours", "created_at", "is_impedimento", "is_duvida", "username",
 ]
 
 class DatabaseConnection:
@@ -53,6 +53,7 @@ class LogRepository:
 
         self._ensure_column("work_logs", "is_impedimento", "INTEGER DEFAULT 0")
         self._ensure_column("work_logs", "is_duvida", "INTEGER DEFAULT 0")
+        self._ensure_column("work_logs", "username", "TEXT")
 
         query_options = """
         CREATE TABLE IF NOT EXISTS custom_options (
@@ -64,6 +65,7 @@ class LogRepository:
         );
         """
         self.conn.execute(query_options)
+        self._ensure_column("custom_options", "username", "TEXT")
         self.conn.commit()
 
     def _ensure_column(self, table: str, column: str, column_def: str):
@@ -72,21 +74,21 @@ class LogRepository:
             self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_def}")
             self.conn.commit()
 
-    def get_custom_options(self, option_type: str) -> list:
+    def get_custom_options(self, option_type: str, username: str) -> list:
         rows = self.conn.execute(
-            "SELECT value FROM custom_options WHERE option_type = ? ORDER BY value COLLATE NOCASE",
-            (option_type,),
+            "SELECT value FROM custom_options WHERE option_type = ? AND username = ? ORDER BY value COLLATE NOCASE",
+            (option_type, username),
         ).fetchall()
         return [r[0] for r in rows]
 
-    def add_custom_option(self, option_type: str, value: str) -> bool:
+    def add_custom_option(self, option_type: str, username: str, value: str) -> bool:
         value = value.strip()
         if not value:
             return False
         try:
             self.conn.execute(
-                "INSERT INTO custom_options (option_type, value) VALUES (?, ?)",
-                (option_type, value),
+                "INSERT INTO custom_options (option_type, username, value) VALUES (?, ?, ?)",
+                (option_type, username, value),
             )
             self.conn.commit()
             return True
@@ -95,14 +97,14 @@ class LogRepository:
                 return False
             raise
 
-    def delete_custom_option(self, option_type: str, value: str):
+    def delete_custom_option(self, option_type: str, username: str, value: str):
         self.conn.execute(
-            "DELETE FROM custom_options WHERE option_type = ? AND value = ?",
-            (option_type, value),
+            "DELETE FROM custom_options WHERE option_type = ? AND username = ? AND value = ?",
+            (option_type, username, value),
         )
         self.conn.commit()
 
-    def rename_custom_option(self, option_type: str, old_value: str, new_value: str) -> bool:
+    def rename_custom_option(self, option_type: str, username: str, old_value: str, new_value: str) -> bool:
         old_value = (old_value or "").strip()
         new_value = (new_value or "").strip()
         if not new_value or old_value == new_value:
@@ -111,12 +113,12 @@ class LogRepository:
         column = "project" if option_type == "project" else "category"
         try:
             self.conn.execute(
-                "UPDATE custom_options SET value = ? WHERE option_type = ? AND value = ?",
-                (new_value, option_type, old_value),
+                "UPDATE custom_options SET value = ? WHERE option_type = ? AND username = ? AND value = ?",
+                (new_value, option_type, username, old_value),
             )
             self.conn.execute(
-                f"UPDATE work_logs SET {column} = ? WHERE {column} = ?",
-                (new_value, old_value),
+                f"UPDATE work_logs SET {column} = ? WHERE {column} = ? AND username = ?",
+                (new_value, old_value, username),
             )
             self.conn.commit()
             return True
@@ -129,28 +131,34 @@ class LogRepository:
                 return False
             raise
 
-    def insert_log(self, log_date: str, project: str, category: str, description: str, effort_hours: float,
+    def insert_log(self, username: str, log_date: str, project: str, category: str, description: str, effort_hours: float,
                     is_impedimento: bool = False, is_duvida: bool = False):
-        query = ("INSERT INTO work_logs (log_date, project, category, description, effort_hours, "
-                 "is_impedimento, is_duvida) VALUES (?, ?, ?, ?, ?, ?, ?)")
-        self.conn.execute(query, (log_date, project, category, description, effort_hours,
+        query = ("INSERT INTO work_logs (username, log_date, project, category, description, effort_hours, "
+                 "is_impedimento, is_duvida) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        self.conn.execute(query, (username, log_date, project, category, description, effort_hours,
                                    int(bool(is_impedimento)), int(bool(is_duvida))))
         self.conn.commit()
 
-    def update_log(self, log_id: int, log_date: str, project: str, category: str, description: str, effort_hours: float,
+    def update_log(self, log_id: int, username: str, log_date: str, project: str, category: str, description: str, effort_hours: float,
                     is_impedimento: bool = False, is_duvida: bool = False):
+        # O PORQUE: o "AND username = ?" no WHERE não é só um filtro -- é uma
+        # segunda camada de proteção contra um usuário editar/apagar um log
+        # de outra pessoa (defesa em profundidade), mesmo que algum bug na
+        # tela permitisse mandar um log_id de outro usuário por engano.
         query = ("UPDATE work_logs SET log_date = ?, project = ?, category = ?, description = ?, effort_hours = ?, "
-                 "is_impedimento = ?, is_duvida = ? WHERE id = ?")
+                 "is_impedimento = ?, is_duvida = ? WHERE id = ? AND username = ?")
         self.conn.execute(query, (log_date, project, category, description, effort_hours,
-                                   int(bool(is_impedimento)), int(bool(is_duvida)), log_id))
+                                   int(bool(is_impedimento)), int(bool(is_duvida)), log_id, username))
         self.conn.commit()
 
-    def delete_log(self, log_id: int):
-        self.conn.execute("DELETE FROM work_logs WHERE id = ?", (log_id,))
+    def delete_log(self, log_id: int, username: str):
+        self.conn.execute("DELETE FROM work_logs WHERE id = ? AND username = ?", (log_id, username))
         self.conn.commit()
 
-    def get_all_logs_as_dataframe(self) -> pd.DataFrame:
-        cursor = self.conn.execute("SELECT * FROM work_logs ORDER BY log_date DESC")
+    def get_all_logs_as_dataframe(self, username: str) -> pd.DataFrame:
+        cursor = self.conn.execute(
+            "SELECT * FROM work_logs WHERE username = ? ORDER BY log_date DESC", (username,)
+        )
         rows = cursor.fetchall()
         try:
             columns = [d[0] for d in cursor.description]
