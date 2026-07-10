@@ -309,6 +309,20 @@ def get_repository():
 
 repo = get_repository()
 
+if not repo.db_connection.using_turso and (os.environ.get("TURSO_DATABASE_URL") or os.environ.get("TURSO_AUTH_TOKEN")):
+    # O PORQUE: só mostra este aviso se havia credencial configurada mas a
+    # conexão caiu para o SQLite local mesmo assim -- isso é sério no
+    # Streamlit Cloud (disco efêmero: os dados gravados "somem" no próximo
+    # redeploy/sleep). Se não há credencial nenhuma (ex.: rodando local de
+    # propósito), o fallback é esperado e não precisa alarmar ninguém.
+    st.warning(
+        "⚠️ Não foi possível conectar ao banco Turso -- o app está usando um banco local "
+        "temporário. Se isto estiver rodando no Streamlit Cloud, os dados gravados agora "
+        "**serão perdidos** no próximo deploy. Verifique TURSO_DATABASE_URL/TURSO_AUTH_TOKEN "
+        "em Settings → Secrets (veja os logs em 'Manage app' para o motivo exato).",
+        icon="⚠️",
+    )
+
 
 def _current_user() -> str:
     # O PORQUE: ponto único usado em toda consulta/gravação no banco para

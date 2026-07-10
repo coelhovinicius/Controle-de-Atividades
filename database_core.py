@@ -17,23 +17,40 @@ WORK_LOGS_COLUMNS = [
 class DatabaseConnection:
     def __init__(self, db_name: str = "personal_tracker.db"):
         self.db_name = db_name
+        self.using_turso = False  # O PORQUE: app.py usa isso para avisar na
+                                   # tela se caiu para o banco local (o que,
+                                   # no Streamlit Cloud, é um problema sério:
+                                   # disco efêmero, dados "somem" a cada deploy).
 
     def get_connection(self):
         # Tenta conectar ao Turso se as credenciais estiverem presentes
         if TURSO_DATABASE_URL and TURSO_AUTH_TOKEN:
             try:
                 import libsql
-                return libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+                conn = libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+                # O PORQUE: connect() do libsql não faz nenhuma chamada de
+                # rede -- só monta o cliente. Se a URL ou o token estiverem
+                # errados/expirados, o erro só aparece na PRIMEIRA consulta
+                # real, e o libsql embrulha esse erro (incluindo falhas de
+                # autenticação) como ValueError genérico. Sem este teste
+                # aqui, esse ValueError estourava sem tratamento lá na
+                # frente (dentro de _initialize_database), derrubando o app
+                # inteiro com uma mensagem redigida pelo Streamlit Cloud.
+                conn.execute("SELECT 1")
+                self.using_turso = True
+                return conn
             except ImportError:
                 print("AVISO: Driver 'libsql' não instalado. Ignorando Turso e usando banco local.", file=sys.stderr)
             except Exception as e:
-                print(f"ERRO: Falha ao conectar ao Turso: {e}. Usando banco local.", file=sys.stderr)
-        
+                print(f"ERRO: Falha ao conectar/autenticar no Turso: {e}. Usando banco local.", file=sys.stderr)
+
         # Fallback padrão para SQLite local
+        self.using_turso = False
         return sqlite3.connect(self.db_name, check_same_thread=False)
 
 class LogRepository:
     def __init__(self, db_connection: DatabaseConnection):
+        self.db_connection = db_connection
         self.conn = db_connection.get_connection()
         self._initialize_database()
 
