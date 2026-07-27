@@ -16,3 +16,9 @@ libsql>=0.1.0
 # secrets.toml (bcrypt.hashpw / bcrypt.checkpw), em vez de guardar a senha
 # em texto puro -- ver gerar_hash_senha.py.
 bcrypt>=4.1
+# O PORQUE: já vinha instalado como dependência transitiva do Streamlit,
+# mas o app agora chama requests.post() diretamente (pra falar com o
+# webhook de estimativa de esforço por IA no n8n) -- declarar aqui deixa
+# essa dependência explícita, em vez de confiar que uma versão futura do
+# Streamlit continue trazendo requests "de brinde".
+requests>=2.27

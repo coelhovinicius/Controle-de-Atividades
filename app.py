@@ -8,7 +8,10 @@ import unicodedata
 import time
 import os
 import sys
+import hmac
+import base64
 import bcrypt
+import requests
 import secrets as pysecrets
 from io import StringIO
 from datetime import datetime, timedelta
@@ -88,38 +91,78 @@ if not repo.db_connection.using_turso and (os.environ.get("TURSO_DATABASE_URL") 
 
 # O PORQUE: st.session_state é por sessão de navegador e se perde ao
 # recarregar a página (F5) -- por isso, sozinho, não sustenta "ficar logado
-# até clicar em Sair". Este dicionário vive no nível do processo Python (não
-# dentro de session_state), sobrevive a reruns/reloads de qualquer aba
-# enquanto o servidor Streamlit continuar de pé, e guarda só um token
-# aleatório -> {usuário, validade} (nunca a senha). O token vai para a URL
-# (?s=...) para sobreviver a um F5; ao clicar em "Sair", o token é removido
-# daqui -- então mesmo quem tiver guardado aquele link antigo não consegue
-# mais entrar com ele.
-_ACTIVE_SESSIONS = {}
+# até clicar em Sair". O token vai para a URL (?s=...) para sobreviver a um
+# F5, e agora ele mesmo carrega usuário + validade, ASSINADOS com HMAC --
+# ou seja, validar o token não depende de nenhum dicionário na memória do
+# processo. Isso significa que a sessão sobrevive não só a um F5, mas
+# também a um restart do servidor (Ctrl+C + rodar de novo, ou um redeploy
+# no Streamlit Cloud), desde que SESSION_SECRET_KEY esteja configurada nos
+# Secrets (veja abaixo) -- sem isso, cada restart gera uma chave nova
+# sozinho, e a sessão se comporta como antes (só sobrevive a F5, não a
+# restart).
 SESSION_TTL_HOURS = 12
+
+# O PORQUE: chave que assina (HMAC) o token de sessão. NÃO é uma senha de
+# ninguém -- é só um segredo do servidor usado pra garantir que o token não
+# foi forjado. Se SESSION_SECRET_KEY não estiver configurada nos Secrets,
+# cai num valor aleatório gerado uma vez por processo -- funciona
+# perfeitamente para F5 (que não reinicia o processo), mas qualquer restart
+# do servidor invalida as sessões existentes (comportamento seguro por
+# padrão: nunca cai num valor fixo/previsível "por engano"). Para a sessão
+# sobreviver também a restarts, gere uma vez com:
+#   python -c "import secrets; print(secrets.token_urlsafe(32))"
+# e cole o resultado em SESSION_SECRET_KEY nos Secrets.
+SESSION_SECRET_KEY = os.environ.get("SESSION_SECRET_KEY", "").strip() or pysecrets.token_urlsafe(32)
+
+# O PORQUE: tokens revogados explicitamente (botão "Sair") antes do prazo
+# natural de expiração. O token em si já é auto-verificável (HMAC) e não
+# depende desta lista pra ser considerado válido -- ela só serve pra
+# lembrar "isto aqui foi desconectado antes da hora". Ainda vive em
+# memória (reseta num restart do servidor) -- na prática, isso só significa
+# que um "Sair" feito poucas horas antes de um restart poderia, em teoria,
+# voltar a valer até a expiração natural depois do restart. Risco baixo
+# para um app pessoal, e a troca vale a pena pelo ganho de sobreviver a
+# restarts no caso comum (sem logout no meio).
+_REVOKED_TOKENS = set()
 
 
 def _criar_sessao(username: str) -> str:
-    token = pysecrets.token_urlsafe(32)
-    _ACTIVE_SESSIONS[token] = {
-        "username": username,
-        "expires_at": datetime.now() + timedelta(hours=SESSION_TTL_HOURS),
-    }
-    return token
+    expires_at = (datetime.now() + timedelta(hours=SESSION_TTL_HOURS)).isoformat()
+    payload = f"{username}|{expires_at}"
+    payload_b64 = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("utf-8").rstrip("=")
+    signature = hmac.new(SESSION_SECRET_KEY.encode("utf-8"), payload_b64.encode("utf-8"), digestmod="sha256").hexdigest()
+    return f"{payload_b64}.{signature}"
 
 
 def _validar_sessao(token: str):
-    info = _ACTIVE_SESSIONS.get(token)
-    if not info:
+    if not token or "." not in token:
         return None
-    if datetime.now() > info["expires_at"]:
-        _ACTIVE_SESSIONS.pop(token, None)
+    payload_b64, _, signature = token.rpartition(".")
+
+    # O PORQUE: hmac.compare_digest em vez de "==" -- evita que o tempo de
+    # resposta vaze informação sobre até onde a assinatura bateu certo
+    # (mesma mitigação de timing attack usada no login).
+    expected_signature = hmac.new(SESSION_SECRET_KEY.encode("utf-8"), payload_b64.encode("utf-8"), digestmod="sha256").hexdigest()
+    if not hmac.compare_digest(signature, expected_signature):
         return None
-    return info["username"]
+    if token in _REVOKED_TOKENS:
+        return None
+
+    try:
+        padding = "=" * (-len(payload_b64) % 4)
+        payload = base64.urlsafe_b64decode(payload_b64 + padding).decode("utf-8")
+        username, expires_at_iso = payload.rsplit("|", 1)
+        expires_at = datetime.fromisoformat(expires_at_iso)
+    except Exception:
+        return None
+
+    if datetime.now() > expires_at:
+        return None
+    return username
 
 
 def _revogar_sessao(token: str):
-    _ACTIVE_SESSIONS.pop(token, None)
+    _REVOKED_TOKENS.add(token)
 
 
 
@@ -497,6 +540,151 @@ def get_project_options() -> list:
 def get_category_options() -> list:
     custom = [c for c in repo.get_custom_options("category", _current_user()) if c not in BASE_CATEGORY_OPTIONS]
     return BASE_CATEGORY_OPTIONS + custom
+
+
+# ==========================================
+# ESTIMATIVA DE ESFORÇO POR IA (via n8n)
+# ==========================================
+# O PORQUE: chave nova, opcional -- se não estiver configurada, os recursos
+# de IA (estimativa de duração + classificação de projeto/categoria) ficam
+# desligados automaticamente, e tanto a Sincronização quanto o formulário
+# manual caem no comportamento anterior (esforço digitado/flat + escolha
+# manual de projeto/categoria). Nada quebra pra quem não configurar isso.
+N8N_AI_ESTIMATE_WEBHOOK_URL = os.environ.get("N8N_AI_ESTIMATE_WEBHOOK_URL", "").strip()
+
+# O PORQUE: palavras literais que você mesmo escreve nas suas anotações pra
+# marcar um dia de plantão/hora extra -- é uma DETECÇÃO POR PALAVRA-CHAVE
+# (não por IA) de propósito: é um marcador que você escolhe escrever, não
+# algo que precise de julgamento/interpretação. "OVERTIME" cobre os
+# registros mais recentes; "plantão"/"plantao" cobre os mais antigos (>1-2
+# meses), como você descreveu.
+OVERTIME_DAY_KEYWORDS = ["overtime", "plantão", "plantao"]
+
+
+def estimar_esforco_com_ia(tasks: list, known_projects: list, known_categories: list, timeout: int = 90):
+    """
+    tasks: lista de dicts {"id": int, "description": str}.
+    Retorna (results, error_message). Em caso de sucesso, error_message é
+    None e results é uma lista de dicts {"id", "estimated_minutes",
+    "project", "category", "is_new_project", "is_new_category"}. Em caso de
+    falha (webhook não configurado, n8n fora do ar, resposta inválida da
+    IA etc.), results é None e error_message explica o motivo -- quem
+    chamar esta função deve, nesse caso, cair de volta pro comportamento
+    sem IA (mesmo padrão de fallback usado para o Turso).
+    """
+    if not N8N_AI_ESTIMATE_WEBHOOK_URL:
+        return None, "N8N_AI_ESTIMATE_WEBHOOK_URL não configurado nos Secrets."
+    if not tasks:
+        return [], None
+    try:
+        resp = requests.post(
+            N8N_AI_ESTIMATE_WEBHOOK_URL,
+            json={"known_projects": known_projects, "known_categories": known_categories, "tasks": tasks},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        results = data.get("results")
+        if not isinstance(results, list):
+            return None, data.get("error", "Resposta do workflow de IA em formato inesperado.")
+        return results, None
+    except requests.exceptions.Timeout:
+        return None, f"O workflow de IA não respondeu em {timeout}s (timeout)."
+    except Exception as e:
+        return None, f"Falha ao chamar o workflow de IA: {e}"
+
+
+def compute_overtime_days(df: pd.DataFrame) -> set:
+    # O PORQUE: um dia inteiro é "de plantão/overtime" se QUALQUER uma das
+    # descrições registradas naquele dia contiver a palavra-chave -- não
+    # precisa estar em toda tarefa do dia, só precisa aparecer uma vez pra
+    # sinalizar que aquele dia foge do padrão de 8h.
+    overtime_days = set()
+    if df.empty or "log_date" not in df.columns:
+        return overtime_days
+    for log_date, group in df.groupby("log_date"):
+        combined = " ".join(group["description"].astype(str)).lower()
+        if any(kw in combined for kw in OVERTIME_DAY_KEYWORDS):
+            overtime_days.add(log_date)
+    return overtime_days
+
+
+def normalizar_horas_por_dia(df: pd.DataFrame, overtime_days: set, target_hours: float = 8.0) -> pd.DataFrame:
+    """
+    Para cada dia que NÃO estiver em overtime_days, reescala effort_hours
+    proporcionalmente para que a soma do dia bata em target_hours -- mantém
+    a proporção relativa entre as tarefas que a IA estimou (uma tarefa
+    estimada em o dobro da duração de outra continua com o dobro depois de
+    normalizada), só ajusta a escala geral. Dias em overtime_days ficam
+    exatamente como a IA estimou, sem nenhum teto -- na prática, esses dias
+    variam demais (de 30min a 9h a mais) pra qualquer regra fixa fazer
+    sentido; a soma crua da estimativa de cada tarefa é o que reflete a
+    realidade.
+    """
+    df = df.copy()
+    if df.empty or "log_date" not in df.columns:
+        return df
+    for log_date, group_idx in df.groupby("log_date").groups.items():
+        if log_date in overtime_days:
+            continue
+        total = df.loc[group_idx, "effort_hours"].sum()
+        if total <= 0:
+            continue
+        factor = target_hours / total
+        df.loc[group_idx, "effort_hours"] = (df.loc[group_idx, "effort_hours"] * factor).round(2)
+    return df
+
+
+def aplicar_estimativa_ia_e_normalizacao(df_to_insert: pd.DataFrame) -> tuple:
+    """
+    Função de alto nível que orquestra: chamar a IA (via n8n) para estimar
+    duração + classificar projeto/categoria de cada linha de df_to_insert,
+    detectar dias de overtime/plantão, normalizar as horas por dia, e
+    devolver os nomes de projeto/categoria que são realmente novos (para
+    quem chamar decidir se cadastra automaticamente).
+
+    Retorna (df_atualizado, novos_projetos, novas_categorias, aviso).
+    'aviso' é None em caso de sucesso, ou uma string explicando por que a
+    estimativa por IA não foi aplicada (nesse caso, df_atualizado volta
+    IGUAL ao que entrou, sem nenhuma mudança -- comportamento anterior).
+    """
+    if df_to_insert.empty:
+        return df_to_insert, [], [], None
+
+    known_projects = get_project_options()
+    known_categories = get_category_options()
+    tasks = [{"id": i, "description": str(desc)} for i, desc in enumerate(df_to_insert["description"].tolist())]
+
+    results, error = estimar_esforco_com_ia(tasks, known_projects, known_categories)
+    if error:
+        return df_to_insert, [], [], error
+
+    df = df_to_insert.reset_index(drop=True).copy()
+    novos_projetos, novas_categorias = set(), set()
+
+    by_id = {r.get("id"): r for r in results if isinstance(r, dict)}
+    for i in range(len(df)):
+        r = by_id.get(i)
+        if not r:
+            continue
+        minutes = r.get("estimated_minutes")
+        if isinstance(minutes, (int, float)) and minutes > 0:
+            df.at[i, "effort_hours"] = round(minutes / 60.0, 2)
+        project = (r.get("project") or "").strip()
+        category = (r.get("category") or "").strip()
+        if project:
+            df.at[i, "project"] = project
+            if r.get("is_new_project"):
+                novos_projetos.add(project)
+        if category:
+            df.at[i, "category"] = category
+            if r.get("is_new_category"):
+                novas_categorias.add(category)
+
+    overtime_days = compute_overtime_days(df)
+    df = normalizar_horas_por_dia(df, overtime_days)
+
+    return df, sorted(novos_projetos), sorted(novas_categorias), None
 
 
 # O PORQUE: opção especial no fim dos dropdowns de Projeto/Categoria dos
@@ -1209,6 +1397,27 @@ with tab_manage:
             "Todos os campos abaixo são obrigatórios. Em Projeto/Categoria, escolha "
             "\"➕ Criar novo...\" para digitar (e já criar) um nome novo na hora."
         )
+        # O PORQUE: Streamlit NÃO deixa escrever em st.session_state[key] de um
+        # widget que já foi instanciado NESTA MESMA execução -- levanta
+        # StreamlitAPIException na hora, mesmo que um st.rerun() venha logo
+        # depois (foi exatamente o erro que apareceu ao clicar em "Sugerir com
+        # IA": o botão fica ABAIXO dos campos no código, então quando o clique
+        # é processado, add_effort/add_proj_select/add_cat_select já tinham
+        # acabado de ser desenhados neste run). A solução padrão do Streamlit
+        # pra isso: o botão só guarda a sugestão num campo "pendente" e chama
+        # st.rerun() -- e é bem AQUI, no topo do bloco, ANTES de qualquer
+        # widget do formulário ser criado, que a gente aplica a sugestão
+        # pendente aos campos de verdade (nesse ponto do run, ainda é permitido
+        # escrever, porque os widgets desta vez ainda não foram instanciados).
+        sugestao_pendente = st.session_state.pop("_ia_sugestao_pendente", None)
+        if sugestao_pendente:
+            if sugestao_pendente.get("effort_hours") is not None:
+                st.session_state["add_effort"] = sugestao_pendente["effort_hours"]
+            if sugestao_pendente.get("project"):
+                st.session_state["add_proj_select"] = sugestao_pendente["project"]
+            if sugestao_pendente.get("category"):
+                st.session_state["add_cat_select"] = sugestao_pendente["category"]
+
         # O PORQUE: este bloco NÃO usa st.form -- Projeto/Categoria precisam
         # reagir imediatamente (mostrar o campo de texto ao escolher "Criar
         # novo...", e voltar ao dropdown assim que o nome for confirmado),
@@ -1225,6 +1434,56 @@ with tab_manage:
             effort_hours = st.number_input("Esforço (Horas)", min_value=0.0, step=0.5, value=1.0, key="add_effort")
 
         description = st.text_area("Descrição da Atividade *", key="add_description")
+
+        col_ia, _col_ia_spacer = st.columns([1, 3])
+        with col_ia:
+            btn_ia_sugerir = st.button(
+                "🤖 Sugerir com IA",
+                use_container_width=True,
+                key="add_btn_ia_sugerir",
+                disabled=not N8N_AI_ESTIMATE_WEBHOOK_URL,
+                help=(
+                    "Estima a duração e sugere Projeto/Categoria com base na descrição acima "
+                    "(você continua podendo ajustar tudo antes de salvar)."
+                    if N8N_AI_ESTIMATE_WEBHOOK_URL
+                    else "Configure N8N_AI_ESTIMATE_WEBHOOK_URL nos Secrets para habilitar esta sugestão."
+                ),
+            )
+        if btn_ia_sugerir:
+            desc_atual = st.session_state.get("add_description", "").strip()
+            if not desc_atual:
+                st.warning("Escreva a descrição da atividade antes de pedir uma sugestão.")
+            else:
+                with st.spinner("Consultando IA..."):
+                    results_ia, erro_ia = estimar_esforco_com_ia(
+                        [{"id": 0, "description": desc_atual}], get_project_options(), get_category_options(),
+                    )
+                if erro_ia:
+                    st.warning(f"⚠️ Não foi possível consultar a IA agora ({erro_ia}).")
+                else:
+                    r = results_ia[0] if results_ia else {}
+                    minutes = r.get("estimated_minutes")
+                    project_sugerido = (r.get("project") or "").strip()
+                    category_sugerida = (r.get("category") or "").strip()
+                    if project_sugerido and r.get("is_new_project"):
+                        repo.add_custom_option("project", _current_user(), project_sugerido)
+                    if category_sugerida and r.get("is_new_category"):
+                        repo.add_custom_option("category", _current_user(), category_sugerida)
+                    # O PORQUE: NÃO escrevemos em st.session_state["add_effort"]/
+                    # ["add_proj_select"]/["add_cat_select"] AQUI -- esses
+                    # widgets já foram instanciados mais acima, nesta mesma
+                    # execução, e o Streamlit barra essa escrita com uma
+                    # exceção na hora (StreamlitAPIException). Em vez disso,
+                    # guardamos a sugestão como "pendente" e disparamos
+                    # st.rerun() -- no PRÓXIMO run, o bloco no topo do
+                    # formulário (antes dos widgets serem criados) aplica esses
+                    # valores de verdade.
+                    st.session_state["_ia_sugestao_pendente"] = {
+                        "effort_hours": round(minutes / 60.0, 2) if isinstance(minutes, (int, float)) and minutes > 0 else None,
+                        "project": project_sugerido or None,
+                        "category": category_sugerida or None,
+                    }
+                    st.rerun()
 
         col_imp, col_duv = st.columns(2)
         with col_imp:
@@ -2200,6 +2459,39 @@ with tab_sync:
             if not df_to_delete.empty:
                 df_to_delete.insert(0, "_Aplicar", True)
 
+            # O PORQUE: só tenta a estimativa por IA se houver N8N_AI_ESTIMATE_WEBHOOK_URL
+            # configurado -- sem isso, df_to_insert segue exatamente como antes (esforço
+            # flat de 1h + classificação por palavra-chave do importer_core.py). Com IA
+            # configurada, sobrescreve effort_hours/project/category linha a linha,
+            # detecta dias de OVERTIME/plantão e normaliza o total de cada dia comum
+            # pra ~8h (dias de plantão ficam sem teto, com a soma crua da IA).
+            ia_aviso = None
+            novos_projetos, novas_categorias = [], []
+            if N8N_AI_ESTIMATE_WEBHOOK_URL and not df_to_insert.empty:
+                with st.spinner("Estimando duração e classificando com IA..."):
+                    df_to_insert, novos_projetos, novas_categorias, ia_aviso = aplicar_estimativa_ia_e_normalizacao(df_to_insert)
+
+                if ia_aviso:
+                    st.warning(
+                        f"⚠️ Não foi possível usar a estimativa por IA agora ({ia_aviso}). "
+                        "Os registros abaixo seguem com esforço fixo (1h) e classificação "
+                        "por palavra-chave, como antes -- revise/ajuste manualmente se precisar."
+                    )
+                else:
+                    for proj in novos_projetos:
+                        repo.add_custom_option("project", _current_user(), proj)
+                    for cat in novas_categorias:
+                        repo.add_custom_option("category", _current_user(), cat)
+                    if novos_projetos or novas_categorias:
+                        partes = []
+                        if novos_projetos:
+                            partes.append(f"projeto(s) **{', '.join(novos_projetos)}**")
+                        if novas_categorias:
+                            partes.append(f"categoria(s) **{', '.join(novas_categorias)}**")
+                        st.info(f"🤖 IA aplicada. Adicionado(s) automaticamente: {' e '.join(partes)}.")
+                    else:
+                        st.info("🤖 Estimativa de esforço e classificação por IA aplicada.")
+
             st.session_state.df_to_insert = df_to_insert
             st.session_state.df_to_delete = df_to_delete
             st.session_state.sync_analyzed = True
@@ -2218,19 +2510,26 @@ with tab_sync:
             if st.session_state.df_to_insert.empty:
                 st.success("Nenhum registro novo encontrado no arquivo.")
             else:
-                st.write("Desmarque a caixa `_Aplicar` para ignorar o registro.")
+                st.write("Desmarque a caixa `_Aplicar` para ignorar o registro. Projeto, Categoria e Horas já vêm editáveis (úteis para corrigir uma sugestão da IA, se houver).")
                 # O PORQUE: st.data_editor permite manipulação booleana direto no DataFrame sem loops complexos.
                 # DateColumn com format="DD/MM/YYYY" exibe a data no padrão brasileiro
                 # mesmo com o valor por baixo continuando em ISO (YYYY-MM-DD).
+                # project/category viraram SelectboxColumn (com opção de digitar um
+                # novo valor não listado) e effort_hours virou editável, porque agora
+                # esses três campos podem vir de uma estimativa por IA que às vezes
+                # precisa de um ajuste manual antes de confirmar.
                 edited_insert = st.data_editor(
                     st.session_state.df_to_insert,
                     column_config={
                         "_Aplicar": st.column_config.CheckboxColumn("Aplicar", default=True),
                         "log_date": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
+                        "project": st.column_config.SelectboxColumn("Projeto", options=get_project_options()),
+                        "category": st.column_config.SelectboxColumn("Categoria", options=get_category_options()),
+                        "effort_hours": st.column_config.NumberColumn("Horas", min_value=0.0, max_value=24.0, step=0.25),
                         "is_impedimento": st.column_config.CheckboxColumn("🚧 Impedimento"),
                         "is_duvida": st.column_config.CheckboxColumn("❓ Dúvida"),
                     },
-                    disabled=["log_date", "project", "category", "description", "effort_hours", "is_impedimento", "is_duvida"],
+                    disabled=["log_date", "description", "is_impedimento", "is_duvida"],
                     hide_index=True,
                     use_container_width=True,
                     key="editor_insert"
