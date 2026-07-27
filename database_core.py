@@ -9,6 +9,27 @@ import sys
 TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL")
 TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 
+# O PORQUE: chave nova, opcional, também lida via Secrets/variável de
+# ambiente (mesmo mecanismo do Turso acima). Por padrão é False -- então
+# rodar local sem Turso configurado continua funcionando exatamente como
+# antes (fallback silencioso para SQLite). Em produção (Streamlit Cloud),
+# defina REQUIRE_TURSO = "true" nos Secrets: aí, se o Turso não estiver
+# acessível por qualquer motivo (credencial ausente, token expirado, banco
+# fora do ar), o app para de vez em vez de continuar rodando "por engano"
+# num banco local efêmero (que se perde no próximo redeploy/sleep).
+REQUIRE_TURSO = os.environ.get("REQUIRE_TURSO", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+class TursoRequiredError(RuntimeError):
+    """Levantado quando REQUIRE_TURSO está ativo mas não foi possível obter
+    uma conexão válida com o Turso (credenciais ausentes, driver não
+    instalado, ou falha de conexão/autenticação). app.py captura esta
+    exceção e interrompe a inicialização do app com uma mensagem clara,
+    em vez de deixá-lo continuar sobre um banco local que não é persistente
+    em produção."""
+    pass
+
+
 WORK_LOGS_COLUMNS = [
     "id", "log_date", "project", "category", "description",
     "effort_hours", "created_at", "is_impedimento", "is_duvida", "username",
@@ -40,11 +61,25 @@ class DatabaseConnection:
                 self.using_turso = True
                 return conn
             except ImportError:
-                print("AVISO: Driver 'libsql' não instalado. Ignorando Turso e usando banco local.", file=sys.stderr)
+                msg = "Driver 'libsql' não está instalado no ambiente."
+                print(f"AVISO: {msg}", file=sys.stderr)
+                if REQUIRE_TURSO:
+                    raise TursoRequiredError(msg) from None
             except Exception as e:
-                print(f"ERRO: Falha ao conectar/autenticar no Turso: {e}. Usando banco local.", file=sys.stderr)
+                msg = f"Falha ao conectar/autenticar no Turso: {e}"
+                print(f"ERRO: {msg}", file=sys.stderr)
+                if REQUIRE_TURSO:
+                    raise TursoRequiredError(msg) from e
+        elif REQUIRE_TURSO:
+            # O PORQUE: REQUIRE_TURSO ligado mas nenhuma das duas variáveis
+            # (ou nenhuma delas) está configurada -- não faz sentido nem
+            # tentar conectar, e muito menos cair pro SQLite local.
+            raise TursoRequiredError(
+                "TURSO_DATABASE_URL e/ou TURSO_AUTH_TOKEN não estão configurados nos Secrets."
+            )
 
-        # Fallback padrão para SQLite local
+        # Fallback padrão para SQLite local -- só é alcançado quando
+        # REQUIRE_TURSO é False (comportamento de desenvolvimento local).
         self.using_turso = False
         return sqlite3.connect(self.db_name, check_same_thread=False)
 
@@ -156,6 +191,32 @@ class LogRepository:
                                    int(bool(is_impedimento)), int(bool(is_duvida))))
         self.conn.commit()
 
+    def insert_logs_bulk(self, username: str, rows: list) -> int:
+        # O PORQUE: insert_log() acima dá commit a CADA chamada -- ótimo pra
+        # 1 registro manual, mas péssimo pra importar centenas/milhares de
+        # uma vez (ex.: tela de Sincronização) contra um banco REMOTO
+        # (Turso): cada commit vira uma ida-e-volta de rede, então 2.600
+        # linhas = 2.600 round-trips em série (minutos de espera). Este
+        # método monta todas as linhas e faz um ÚNICO executemany + commit
+        # -- 1 round-trip (ou pertinho disso) pra tudo, independente de ter
+        # 10 ou 10.000 linhas. Cada item de `rows` é um dict com as chaves:
+        # log_date, project, category, description, effort_hours,
+        # is_impedimento (opcional), is_duvida (opcional).
+        if not rows:
+            return 0
+        query = ("INSERT INTO work_logs (username, log_date, project, category, description, effort_hours, "
+                 "is_impedimento, is_duvida) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        tuples_to_insert = [
+            (
+                username, r["log_date"], r["project"], r["category"], r["description"], r["effort_hours"],
+                int(bool(r.get("is_impedimento", False))), int(bool(r.get("is_duvida", False))),
+            )
+            for r in rows
+        ]
+        self.conn.executemany(query, tuples_to_insert)
+        self.conn.commit()
+        return len(tuples_to_insert)
+
     def update_log(self, log_id: int, username: str, log_date: str, project: str, category: str, description: str, effort_hours: float,
                     is_impedimento: bool = False, is_duvida: bool = False):
         # O PORQUE: o "AND username = ?" no WHERE não é só um filtro -- é uma
@@ -171,6 +232,17 @@ class LogRepository:
     def delete_log(self, log_id: int, username: str):
         self.conn.execute("DELETE FROM work_logs WHERE id = ? AND username = ?", (log_id, username))
         self.conn.commit()
+
+    def delete_logs_bulk(self, username: str, log_ids: list) -> int:
+        # O PORQUE: mesmo raciocínio de insert_logs_bulk() -- 1 DELETE com
+        # "IN (...)" e 1 commit, em vez de 1 commit por id apagado.
+        if not log_ids:
+            return 0
+        placeholders = ", ".join(["?"] * len(log_ids))
+        query = f"DELETE FROM work_logs WHERE username = ? AND id IN ({placeholders})"
+        self.conn.execute(query, (username, *log_ids))
+        self.conn.commit()
+        return len(log_ids)
 
     def get_all_logs_as_dataframe(self, username: str) -> pd.DataFrame:
         cursor = self.conn.execute(

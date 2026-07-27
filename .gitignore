@@ -1,35 +1,45 @@
 # Ignora arquivos de configuração de ambiente (como senhas e chaves)
 .env
 
-# Ignora uma pasta inteira (ex: pastas de dependências ou build)
-node_modules/
-dist/
-
-# Ignora todos os arquivos com uma extensão específica
-*.log
-*.db
-*.zip
-v2_online/
-
-# Ignora arquivos específicos
-raw_history.txt
-TURSO_DEPLOY.txt
-backfill_username.py
-
-# O PORQUE: o secrets.toml de verdade tem suas credenciais do Turso -- se
-# fosse commitado, qualquer pessoa com acesso ao repositório (mesmo privado,
-# dependendo de quem tem acesso) poderia ler/escrever no seu banco. No
-# Community Cloud, os segredos são colados diretamente no painel do app
-# (Advanced settings > Secrets), não vêm do repositório.
-.streamlit/secrets.toml
-
-# O PORQUE: depois da migração para o Turso, o arquivo local deixa de ser a
-# fonte de dados de verdade. Mantê-lo fora do git evita confusão (alguém
-# baixar o repo e achar que esses dados ainda são usados pelo app).
-personal_tracker.db
-*.db-journal
-
-__pycache__/
-*.pyc
+# Ambientes virtuais Python -- nenhum dos dois deve ser versionado
+# (o "venv/" sozinho não cobre "venv_linux/", por isso a entrada extra)
 .venv/
 venv/
+venv_linux/
+
+# Cache/artefatos Python
+__pycache__/
+*.pyc
+
+# Bancos de dados locais e logs
+*.db
+*.db-journal
+*.log
+
+# Pacotes/arquivos compactados soltos na raiz (backups, exports pontuais)
+*.zip
+
+# Pasta de rascunho/duplicata antiga -- não deve mais existir no disco,
+# mas mantido aqui como rede de segurança caso alguém recrie sem querer
+v2_online/
+
+# Dado bruto pessoal já importado -- depois da migração para o banco, este
+# arquivo deixa de ser fonte de verdade; mantê-lo fora do git evita
+# confusão (alguém achar que o app ainda lê direto dele)
+raw_history.txt
+
+# O PORQUE: o secrets.toml de verdade tem as credenciais do Turso -- se
+# fosse commitado, qualquer pessoa com acesso ao repositório (mesmo
+# privado, dependendo de quem tem acesso) poderia ler/escrever no seu
+# banco. No Community Cloud, os segredos são colados diretamente no painel
+# do app (Advanced settings > Secrets), não vêm do repositório.
+.streamlit/secrets.toml
+
+# Qualquer secrets.txt solto (ex.: rascunho/exemplo) -- mesmo que hoje não
+# tenha nada sensível, o padrão de nome sozinho já é motivo pra nunca
+# versionar por engano.
+secrets.txt
+.streamlit/secrets.txt
+
+# Pasta de arquivos a serem ignorados
+.ignore/

@@ -7,14 +7,67 @@ import numpy as np
 import unicodedata
 import time
 import os
-import hmac
+import sys
+import bcrypt
 import secrets as pysecrets
 from io import StringIO
 from datetime import datetime, timedelta
-from database_core import DatabaseConnection, LogRepository
+from database_core import DatabaseConnection, LogRepository, TursoRequiredError
 from importer_core import HistoryParser
 
 st.set_page_config(page_title="Task Tracker ", layout="wide", initial_sidebar_state="collapsed")
+
+# ==========================================
+# CONEXÃO COM O BANCO (Turso obrigatório, opcionalmente)
+# ==========================================
+# O PORQUE: este bloco roda ANTES da tela de login (e antes de qualquer
+# outra coisa) de propósito. Com REQUIRE_TURSO=true nos Secrets (recomendado
+# em produção -- veja TURSO_DEPLOY.md), database_core.py levanta
+# TursoRequiredError em vez de cair silenciosamente para o SQLite local
+# quando o Turso não está acessível. Capturamos essa exceção aqui e paramos
+# o app por completo: ninguém consegue nem tentar logar enquanto o banco
+# persistente não estiver disponível -- isso evita que alguém grave
+# atividades "reais" num banco local que se perde no próximo redeploy/sleep
+# do Streamlit Cloud. Localmente, sem REQUIRE_TURSO configurado (o padrão),
+# nada disto muda o comportamento de sempre.
+@st.cache_resource
+def get_repository():
+    db_conn = DatabaseConnection()
+    return LogRepository(db_conn)
+
+
+try:
+    repo = get_repository()
+except TursoRequiredError as e:
+    st.title("📊 Task Tracker")
+    st.error(
+        "🚫 **Não foi possível conectar ao banco de dados Turso, e o app está "
+        "configurado para exigi-lo (`REQUIRE_TURSO=true`).**\n\n"
+        f"Motivo: {e}\n\n"
+        "O app foi interrompido de propósito para não gravar dados num banco local "
+        "temporário (que seria perdido no próximo redeploy/sleep). Verifique "
+        "`TURSO_DATABASE_URL` e `TURSO_AUTH_TOKEN` em Settings → Secrets."
+    )
+    st.stop()
+
+if not repo.db_connection.using_turso and (os.environ.get("TURSO_DATABASE_URL") or os.environ.get("TURSO_AUTH_TOKEN")):
+    # O PORQUE: só chega aqui quando REQUIRE_TURSO NÃO está ativo (senão o
+    # bloco acima já teria parado o app) -- então isto é só um aviso, para
+    # quem preferir permitir o fallback mesmo assim. Mostra se havia
+    # credencial configurada mas a conexão caiu para o SQLite local mesmo
+    # assim -- sério no Streamlit Cloud (disco efêmero: os dados gravados
+    # "somem" no próximo redeploy/sleep). Se não há credencial nenhuma (ex.:
+    # rodando local de propósito), o fallback é esperado e não precisa
+    # alarmar ninguém.
+    st.warning(
+        "⚠️ Não foi possível conectar ao banco Turso -- o app está usando um banco local "
+        "temporário. Se isto estiver rodando no Streamlit Cloud, os dados gravados agora "
+        "**serão perdidos** no próximo deploy. Verifique TURSO_DATABASE_URL/TURSO_AUTH_TOKEN "
+        "em Settings → Secrets (veja os logs em 'Manage app' para o motivo exato). "
+        "Para impedir que o app sequer rode nessa situação, defina `REQUIRE_TURSO = \"true\"` "
+        "nos Secrets.",
+        icon="⚠️",
+    )
 
 # ==========================================
 # LOGIN
@@ -23,14 +76,15 @@ st.set_page_config(page_title="Task Tracker ", layout="wide", initial_sidebar_st
 # privado por conta, e essa cota já está em uso por outro app. Em vez de
 # depender do controle de acesso nativo do Streamlit (email convidado), o
 # app fica "Public" no Streamlit, e o controle de acesso de verdade é feito
-# aqui: nada do app roda (nem a conexão com o banco) até o login ser
-# validado contra usuário/senha configurados nos Secrets.
+# aqui: nenhuma tela de dados/formulário é exibida até o login ser validado
+# contra usuário/senha (hash bcrypt) configurados nos Secrets. (A conexão
+# com o banco, por sua vez, é verificada logo acima, ANTES até do login --
+# ver bloco "CONEXÃO COM O BANCO".)
 #
 # Configuração esperada em .streamlit/secrets.toml (local) e em
 # Settings > Secrets (Community Cloud) -- veja secrets.toml.example:
 #   [credentials]
-#   "seu_usuario" = "sua_senha"
-#   "outro_usuario" = "outra_senha"
+#   "seu_usuario" = "$2b$12$...hash bcrypt, gerado com gerar_hash_senha.py..."
 
 # O PORQUE: st.session_state é por sessão de navegador e se perde ao
 # recarregar a página (F5) -- por isso, sozinho, não sustenta "ficar logado
@@ -68,6 +122,15 @@ def _revogar_sessao(token: str):
     _ACTIVE_SESSIONS.pop(token, None)
 
 
+
+# O PORQUE: hash bcrypt "morto" (não corresponde a nenhuma senha real), usado
+# só para gastar o mesmo tempo de CPU de uma verificação de verdade quando o
+# usuário nem existe -- evita que o tempo de resposta denuncie por timing se
+# o usuário existe ou não. Gerado uma única vez com bcrypt.hashpw sobre uma
+# string aleatória qualquer; não precisa (nem deve) ser trocado.
+_DUMMY_BCRYPT_HASH = b"$2b$12$C6UzMDM.H6dfI/f/IKcEeO0nUxx9wLpXt2z0LU5j7dJp6YbMkMQZm"
+
+
 def _validar_login(username: str, password: str) -> bool:
     try:
         credentials = st.secrets.get("credentials", {})
@@ -85,14 +148,37 @@ def _validar_login(username: str, password: str) -> bool:
         )
         return False
 
-    if not username or username not in credentials:
-        # O PORQUE: mesmo com usuário inexistente, ainda comparamos contra uma
-        # senha "vazia" via compare_digest (em vez de retornar False na hora)
-        # -- assim o tempo de resposta não denuncia se o usuário existe ou
-        # não (mitigação simples de timing attack).
-        hmac.compare_digest("", password or "")
+    # O PORQUE: os valores em [credentials] agora são HASHES bcrypt (gerados
+    # com gerar_hash_senha.py), não mais a senha em texto puro. Assim, mesmo
+    # que alguém tenha acesso de leitura aos Secrets (um segundo admin do
+    # workspace, um backup, um print de tela por engano, um vazamento do
+    # painel do Streamlit Cloud), não dá pra recuperar a senha original --
+    # só o hash, que não é reversível.
+    password_bytes = (password or "").encode("utf-8")
+    stored_value = credentials.get(username) if username else None
+
+    if stored_value is None:
+        # O PORQUE: mesmo com usuário inexistente, ainda rodamos uma
+        # verificação bcrypt contra um hash "morto" -- bcrypt.checkpw sozinho
+        # já tem custo (e portanto tempo de resposta) parecido entre
+        # sucesso/falha, e isso reforça que a ausência do usuário não seja
+        # visível por diferença de tempo.
+        try:
+            bcrypt.checkpw(password_bytes, _DUMMY_BCRYPT_HASH)
+        except Exception:
+            pass
         return False
-    return hmac.compare_digest(str(credentials[username]), password or "")
+
+    try:
+        return bcrypt.checkpw(password_bytes, str(stored_value).encode("utf-8"))
+    except (ValueError, TypeError):
+        # O PORQUE: um valor mal formado em [credentials] (ex.: alguém colou
+        # a senha em texto puro por engano, em vez do hash gerado pelo
+        # gerar_hash_senha.py) não deve derrubar o app com uma exceção --
+        # trata como login inválido e avisa no log do servidor, para o dono
+        # do app perceber e corrigir o secrets.toml.
+        print(f"AVISO: valor em [credentials] para '{username}' não é um hash bcrypt válido.", file=sys.stderr)
+        return False
 
 
 def _limpar_sessao_local(revogar: bool = True):
@@ -175,9 +261,23 @@ if not st.session_state.authenticated:
 # fonte e o peso do texto das abas. Os seletores cobrem tanto a estrutura
 # mais recente do Streamlit (com <p> dentro do botão) quanto uma variação
 # mais antiga, para o destaque funcionar independente da versão instalada.
+#
+# O PORQUE (responsividade): o 1.5rem fixo de antes ficava ótimo em
+# desktop/tablet, mas em celular "comia" a tela toda com texto de aba
+# gigante, e em monitores muito grandes (ultrawide, 4K) o conteúdo esticava
+# de ponta a ponta, ficando fino e difícil de ler. A solução usa 3 partes:
+#   1) Um teto de largura no container principal (.main .block-container),
+#      centralizado, para telas muito grandes -- em vez de esticar o
+#      conteúdo, sobra respiro nas laterais, como em qualquer site bem
+#      comportado.
+#   2) Media query para tablets/telas médias -- ajusta só o padding lateral.
+#   3) Media query para celular (max-width: 640px) -- reduz fonte de abas,
+#      títulos (h1/h2/h3) e padding, e empilha melhor os elementos, sem
+#      depender de detectar o dispositivo por JavaScript.
 st.markdown(
     """
     <style>
+    /* Base: todas as telas */
     .stTabs [data-baseweb="tab-list"] button {
         height: auto;
         padding: 14px 24px;
@@ -189,6 +289,50 @@ st.markdown(
     .stTabs [data-baseweb="tab-list"] button div {
         font-size: 1.5rem;
         font-weight: 700;
+    }
+
+    /* Teto de largura para telas grandes/ultrawide -- evita conteúdo
+       esticado de ponta a ponta; abaixo desse ponto (a maioria dos
+       desktops/tablets), o layout continua exatamente como antes. */
+    .main .block-container {
+        max-width: 1600px;
+        margin-left: auto;
+        margin-right: auto;
+    }
+
+    /* Tablets e notebooks menores: só reduz um pouco o padding lateral */
+    @media (max-width: 992px) {
+        .main .block-container {
+            padding-left: 1.5rem;
+            padding-right: 1.5rem;
+        }
+    }
+
+    /* Celular: abas, títulos e padding menores, para não dominar a tela */
+    @media (max-width: 640px) {
+        .stTabs [data-baseweb="tab-list"] button {
+            padding: 8px 10px;
+        }
+        .stTabs [data-baseweb="tab-list"] button [data-testid="stMarkdownContainer"] p,
+        .stTabs [data-baseweb="tab-list"] button div {
+            font-size: 0.95rem !important;
+            font-weight: 600 !important;
+        }
+        .main .block-container {
+            padding-left: 0.7rem;
+            padding-right: 0.7rem;
+            padding-top: 1.5rem;
+        }
+        h1 { font-size: 1.5rem !important; }
+        h2 { font-size: 1.2rem !important; }
+        h3 { font-size: 1.05rem !important; }
+        /* Botões grandes de "Aplicar Filtro"/"Novo Registro" etc. ficam
+           ocupando linha inteira e um pouco mais baixos, mais fáceis de
+           tocar com o dedo. */
+        .stButton button, .stFormSubmitButton button {
+            padding-top: 0.6rem;
+            padding-bottom: 0.6rem;
+        }
     }
     </style>
     """,
@@ -291,6 +435,37 @@ def build_color_map(base_map: dict, values) -> dict:
             idx += 1
     return color_map
 
+
+# O PORQUE (responsividade dos gráficos): o Plotly usa tamanho de fonte fixo
+# em pixels, que não escala sozinho com a largura do container -- então o
+# mesmo gráfico que fica ótimo num monitor grande pode sair com textos
+# sobrepostos/apertados num celular, e com espaço em branco desperdiçado
+# (margens grandes, legenda lateral) num monitor ultrawide. Em vez de tentar
+# detectar o tamanho de tela real (exigiria JavaScript/componente extra),
+# esta função aplica um layout "neutro", que funciona razoavelmente bem em
+# qualquer largura: fonte um pouco menor que o padrão do Plotly, legenda
+# horizontal embaixo do gráfico (em vez de do lado, que rouba largura útil
+# em telas estreitas), margens enxutas, e rótulos do eixo X inclinados
+# quando há muitas categorias (evita sobreposição de texto).
+def apply_responsive_layout(fig, rotate_xaxis: bool = False):
+    fig.update_layout(
+        font=dict(size=12),
+        title_font=dict(size=15),
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.25,
+            xanchor="center",
+            x=0.5,
+            font=dict(size=11),
+        ),
+        margin=dict(l=10, r=10, t=50, b=10),
+    )
+    if rotate_xaxis:
+        fig.update_xaxes(tickangle=-45, tickfont=dict(size=10))
+    return fig
+
+
 # O PORQUE: Limite de upload em MB. O valor "oficial" (que barra o arquivo
 # antes mesmo de chegar ao servidor) fica em .streamlit/config.toml
 # (server.maxUploadSize). Essa constante e a checagem abaixo sao uma segunda
@@ -299,29 +474,6 @@ def build_color_map(base_map: dict, values) -> dict:
 # portugues em vez do erro generico do Streamlit.
 MAX_UPLOAD_SIZE_MB = 20
 MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
-
-
-@st.cache_resource
-def get_repository():
-    db_conn = DatabaseConnection()
-    return LogRepository(db_conn)
-
-
-repo = get_repository()
-
-if not repo.db_connection.using_turso and (os.environ.get("TURSO_DATABASE_URL") or os.environ.get("TURSO_AUTH_TOKEN")):
-    # O PORQUE: só mostra este aviso se havia credencial configurada mas a
-    # conexão caiu para o SQLite local mesmo assim -- isso é sério no
-    # Streamlit Cloud (disco efêmero: os dados gravados "somem" no próximo
-    # redeploy/sleep). Se não há credencial nenhuma (ex.: rodando local de
-    # propósito), o fallback é esperado e não precisa alarmar ninguém.
-    st.warning(
-        "⚠️ Não foi possível conectar ao banco Turso -- o app está usando um banco local "
-        "temporário. Se isto estiver rodando no Streamlit Cloud, os dados gravados agora "
-        "**serão perdidos** no próximo deploy. Verifique TURSO_DATABASE_URL/TURSO_AUTH_TOKEN "
-        "em Settings → Secrets (veja os logs em 'Manage app' para o motivo exato).",
-        icon="⚠️",
-    )
 
 
 def _current_user() -> str:
@@ -1558,6 +1710,25 @@ with tab_dashboard:
 
                     st.dataframe(df_display_dash, use_container_width=True, hide_index=True)
 
+                    # O PORQUE: antes dos gráficos, um resumo numérico rápido
+                    # ("os números do período") -- dá uma leitura instantânea sem
+                    # precisar interpretar nenhum gráfico. st.metric já empilha
+                    # sozinho em telas estreitas (cada card vira uma linha), então
+                    # não precisa de CSS extra para funcionar bem no celular.
+                    total_horas_periodo = df_filtered["effort_hours"].sum()
+                    total_registros_periodo = len(df_filtered)
+                    dias_uteis_com_registro = df_filtered["log_date_dt"].dt.date.nunique()
+                    media_horas_dia = (total_horas_periodo / dias_uteis_com_registro) if dias_uteis_com_registro else 0
+                    pct_impedimento = (df_filtered["is_impedimento"].astype(int).sum() / total_registros_periodo * 100) if total_registros_periodo else 0
+                    pct_duvida = (df_filtered["is_duvida"].astype(int).sum() / total_registros_periodo * 100) if total_registros_periodo else 0
+
+                    kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+                    kpi1.metric("Total de Horas", f"{total_horas_periodo:.1f}h")
+                    kpi2.metric("Registros", f"{total_registros_periodo}")
+                    kpi3.metric("Média Horas/Dia", f"{media_horas_dia:.1f}h", help="Considera só os dias em que houve pelo menos 1 registro, não os dias corridos do período.")
+                    kpi4.metric("% Impedimentos", f"{pct_impedimento:.0f}%")
+                    kpi5.metric("% Dúvidas", f"{pct_duvida:.0f}%")
+
                     # O PORQUE: Com ranges de data longos, o gráfico diário fica
                     # poluído (dezenas/centenas de pontos ilegíveis no eixo X).
                     # Por isso a granularidade progride em 3 níveis conforme o
@@ -1630,6 +1801,7 @@ with tab_dashboard:
                             type="category", categoryorder="array",
                             categoryarray=df_bar_grouped["period_label"].drop_duplicates().tolist(),
                         )
+                        apply_responsive_layout(fig_time, rotate_xaxis=(len(df_bar_grouped["period_label"].unique()) > 8))
                         st.plotly_chart(fig_time, use_container_width=True)
                     with c_chart2:
                         df_grouped_cat = df_filtered.groupby("category")["effort_hours"].sum().reset_index()
@@ -1637,6 +1809,7 @@ with tab_dashboard:
                             df_grouped_cat, values="effort_hours", names="category", color="category",
                             title="Horas por Área de Atuação", hole=0.4, color_discrete_map=dynamic_category_colors,
                         )
+                        apply_responsive_layout(fig_cat)
                         st.plotly_chart(fig_cat, use_container_width=True)
 
                     st.markdown("---")
@@ -1724,7 +1897,7 @@ with tab_dashboard:
                             fig_line.add_trace(
                                 go.Scatter(
                                     x=trend_labels_all, y=trend_values_all,
-                                    mode="lines", name="Tendência / Previsão (Total)",
+                                    mode="lines", name="Tendência linear (projeção simples)",
                                     line=dict(color="#ffffff", width=2, dash="dot"),
                                 )
                             )
@@ -1749,7 +1922,33 @@ with tab_dashboard:
                             except Exception:
                                 pass
 
+                        apply_responsive_layout(fig_line, rotate_xaxis=(len(df_daily["period_label"].unique()) > 8))
                         st.plotly_chart(fig_line, use_container_width=True)
+
+                        # O PORQUE: o gráfico de evolução é o que mais gera dúvida de
+                        # interpretação (mistura evolução real por projeto + uma
+                        # tendência/projeção linear do total) -- este expander explica
+                        # em linguagem simples o que está sendo mostrado, direto na
+                        # tela, sem precisar perguntar pra ninguém.
+                        with st.expander("ℹ️ Como ler este gráfico"):
+                            st.markdown(
+                                "- Cada **linha colorida** é um projeto: mostra quantas horas "
+                                "você registrou nele em cada período (dia, semana ou mês, "
+                                "dependendo do intervalo escolhido acima).\n"
+                                "- A **linha branca pontilhada** é uma **tendência linear "
+                                "simples** sobre o **total** de horas (somando todos os "
+                                "projetos) -- ela ajuda a ver rapidamente se o esforço total "
+                                "está subindo, caindo ou estável no período filtrado.\n"
+                                "- Depois da **linha vertical cinza tracejada**, a linha "
+                                "branca continua como **projeção**: é apenas a mesma reta "
+                                "de tendência estendida para frente, **não** é um modelo "
+                                "estatístico robusto. Com poucos pontos, ou períodos muito "
+                                "irregulares (ex.: férias, mudança de projeto), essa "
+                                "projeção pode enganar -- use-a como indício, não como "
+                                "número exato a perseguir.\n"
+                                "- É mais confiável quanto **mais pontos** o período filtrado "
+                                "tiver, e quanto mais **regular** for seu ritmo de registro."
+                            )
 
                     with c_chart4:
                         # O PORQUE: Pareto clássico = barras ordenadas decrescentemente
@@ -1797,7 +1996,48 @@ with tab_dashboard:
                         fig_pareto.update_yaxes(title_text="Horas", secondary_y=False)
                         fig_pareto.update_yaxes(title_text="% Acumulado", range=[0, 105], secondary_y=True)
                         fig_pareto.update_layout(title=f"Pareto de Esforço por {pareto_dim_label}", legend=dict(orientation="h", y=-0.2))
+                        apply_responsive_layout(fig_pareto, rotate_xaxis=(len(df_pareto[pareto_dim_col]) > 8))
                         st.plotly_chart(fig_pareto, use_container_width=True)
+
+                    # O PORQUE: nenhum dos 4 gráficos acima mostra a evolução de
+                    # Impedimentos/Dúvidas ao longo do tempo -- só o volume total
+                    # (via % nos KPIs). Este gráfico extra responde uma pergunta
+                    # diferente e bem prática pra quem faz Daily/Retro: "os
+                    # bloqueios estão aumentando, diminuindo, ou concentrados em
+                    # algum período específico?" -- útil pra identificar, por
+                    # exemplo, uma sprint ou projeto com atrito recorrente.
+                    st.markdown("---")
+                    st.subheader("Impedimentos e Dúvidas ao Longo do Tempo")
+                    df_flags = (
+                        df_filtered.groupby(["period_start", "period_label"])
+                        .agg(Impedimentos=("is_impedimento", lambda s: s.astype(int).sum()),
+                             Duvidas=("is_duvida", lambda s: s.astype(int).sum()))
+                        .reset_index()
+                        .sort_values("period_start")
+                    )
+                    if df_flags[["Impedimentos", "Duvidas"]].sum().sum() == 0:
+                        st.info("Nenhum registro marcado como Impedimento ou Dúvida neste período. 🎉")
+                    else:
+                        df_flags_melt = df_flags.melt(
+                            id_vars=["period_start", "period_label"], value_vars=["Impedimentos", "Duvidas"],
+                            var_name="Tipo", value_name="Quantidade",
+                        )
+                        fig_flags = px.bar(
+                            df_flags_melt, x="period_label", y="Quantidade", color="Tipo",
+                            title=f"Impedimentos e Dúvidas por {period_axis_title}", barmode="stack",
+                            labels={"period_label": period_axis_title, "Quantidade": "Nº de Registros"},
+                            color_discrete_map={"Impedimentos": "#d62728", "Duvidas": "#bcbd22"},
+                        )
+                        fig_flags.update_xaxes(
+                            type="category", categoryorder="array",
+                            categoryarray=df_flags["period_label"].drop_duplicates().tolist(),
+                        )
+                        apply_responsive_layout(fig_flags, rotate_xaxis=(len(df_flags["period_label"].unique()) > 8))
+                        st.plotly_chart(fig_flags, use_container_width=True)
+                        st.caption(
+                            "Cada barra soma quantos registros do período foram marcados como "
+                            "🚧 Impedimento e/ou ❓ Dúvida (um mesmo registro pode contar nos dois)."
+                        )
 
                     # O PORQUE: a exportação fica ao final da página, depois de
                     # todos os gráficos, para o usuário primeiro enxergar a
@@ -2037,27 +2277,42 @@ with tab_sync:
                 records_inserted = 0
                 records_deleted = 0
 
+                # O PORQUE: antes, este bloco chamava repo.insert_log()/
+                # delete_log() um registro por vez dentro de um for -- cada
+                # chamada dá commit imediatamente, e contra um banco REMOTO
+                # (Turso) isso significa 1 ida-e-volta de rede POR LINHA.
+                # Sincronizar um raw_history.txt com milhares de linhas
+                # chegava a levar minutos (parecendo travado, sem estar).
+                # Trocado para montar a lista inteira em memória e mandar
+                # tudo de uma vez via insert_logs_bulk()/delete_logs_bulk()
+                # -- 1 (ou pertinho disso) round-trip no total, não um por
+                # linha. O tempo de uma sincronização grande cai de minutos
+                # para segundos.
                 if not edited_insert.empty:
                     to_insert = edited_insert[edited_insert["_Aplicar"] == True]
                     sync_username = _current_user()
+                    rows_to_insert = []
                     for _, row in to_insert.iterrows():
                         # O PORQUE: DateColumn pode devolver datetime.date (ou
                         # Timestamp) em vez de string ao ler o data_editor de volta;
                         # normalizamos para ISO (YYYY-MM-DD) antes de gravar, que é
                         # o formato esperado pela coluna log_date no SQLite.
                         log_date_iso = row["log_date"].strftime("%Y-%m-%d") if hasattr(row["log_date"], "strftime") else str(row["log_date"])
-                        repo.insert_log(
-                            sync_username, log_date_iso, row["project"], row["category"], row["description"], row["effort_hours"],
-                            bool(row.get("is_impedimento", False)), bool(row.get("is_duvida", False)),
-                        )
-                        records_inserted += 1
+                        rows_to_insert.append({
+                            "log_date": log_date_iso,
+                            "project": row["project"],
+                            "category": row["category"],
+                            "description": row["description"],
+                            "effort_hours": row["effort_hours"],
+                            "is_impedimento": bool(row.get("is_impedimento", False)),
+                            "is_duvida": bool(row.get("is_duvida", False)),
+                        })
+                    records_inserted = repo.insert_logs_bulk(sync_username, rows_to_insert)
 
                 if not edited_delete.empty:
                     to_delete = edited_delete[edited_delete["_Aplicar"] == True]
                     sync_username = _current_user()
-                    for _, row in to_delete.iterrows():
-                        repo.delete_log(row["id"], sync_username)
-                        records_deleted += 1
+                    records_deleted = repo.delete_logs_bulk(sync_username, to_delete["id"].tolist())
 
                 st.session_state.sync_analyzed = False
                 st.success(f"Prontinho! {records_inserted} registro(s) adicionado(s) e {records_deleted} removido(s).")

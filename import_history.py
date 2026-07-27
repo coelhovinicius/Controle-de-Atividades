@@ -1,5 +1,15 @@
 import re
 import os
+import sys
+
+# O PORQUE: este script agora mora em scripts/, mas database_core.py
+# continua na raiz do projeto. O Python só olha a pasta do próprio script
+# (não a pasta de onde você chamou "python") para resolver imports -- sem
+# esta linha, "from database_core import ..." abaixo daria
+# ModuleNotFoundError. Isto adiciona a pasta pai (a raiz do projeto) ao
+# caminho de busca de módulos.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from datetime import datetime
 from database_core import DatabaseConnection, LogRepository
 
@@ -208,5 +218,8 @@ class HistoryImporter:
             )
 
 if __name__ == "__main__":
+    # O PORQUE: "raw_history.txt" é relativo à pasta de onde você RODA o
+    # comando (cwd), não à pasta do script. Rode a partir da raiz do
+    # projeto: "python scripts/import_history.py".
     importer = HistoryImporter("raw_history.txt")
     importer.execute_import()

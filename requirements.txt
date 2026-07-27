@@ -12,3 +12,7 @@ pandas>=2.2
 numpy>=1.26
 plotly>=5.24
 libsql>=0.1.0
+# O PORQUE: usado para gerar/checar hashes de senha em [credentials] no
+# secrets.toml (bcrypt.hashpw / bcrypt.checkpw), em vez de guardar a senha
+# em texto puro -- ver gerar_hash_senha.py.
+bcrypt>=4.1
