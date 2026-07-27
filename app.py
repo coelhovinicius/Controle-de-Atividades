@@ -687,6 +687,81 @@ def aplicar_estimativa_ia_e_normalizacao(df_to_insert: pd.DataFrame) -> tuple:
     return df, sorted(novos_projetos), sorted(novas_categorias), None
 
 
+def recalcular_esforco_periodo_com_ia(username: str, start_date, end_date):
+    """
+    Busca os registros JÁ SALVOS entre start_date e end_date, reestima
+    esforço/projeto/categoria por IA (reaproveitando a mesma
+    aplicar_estimativa_ia_e_normalizacao usada na Sincronização e no
+    formulário manual), e GRAVA as mudanças de volta no banco -- diferente
+    da Sincronização, que só afeta linhas novas ainda não gravadas.
+
+    Retorna (quantidade_atualizada, novos_projetos, novas_categorias, aviso).
+    'aviso' != None significa que nada foi alterado (motivo explicado nele).
+    """
+    df_all = repo.get_all_logs_as_dataframe(username)
+    if df_all.empty:
+        return 0, [], [], "Você não tem nenhum registro salvo."
+
+    # O PORQUE: log_date pode vir com hora/timezone dependendo do driver
+    # (sqlite3 local vs libsql/Turso) -- normalizamos pra só "YYYY-MM-DD"
+    # antes de comparar como texto, evitando comparação inconsistente entre
+    # os dois bancos.
+    log_date_str = df_all["log_date"].astype(str).str[:10]
+    mask = (log_date_str >= str(start_date)) & (log_date_str <= str(end_date))
+    df_periodo = df_all.loc[mask].copy()
+    if df_periodo.empty:
+        return 0, [], [], "Nenhum registro encontrado nesse período."
+
+    df_atualizado, novos_projetos, novas_categorias, aviso = aplicar_estimativa_ia_e_normalizacao(df_periodo)
+    if aviso:
+        return 0, [], [], aviso
+
+    for proj in novos_projetos:
+        repo.add_custom_option("project", username, proj)
+    for cat in novas_categorias:
+        repo.add_custom_option("category", username, cat)
+
+    updates = [
+        {
+            "id": int(row["id"]),
+            "effort_hours": float(row["effort_hours"]),
+            "project": row["project"],
+            "category": row["category"],
+        }
+        for _, row in df_atualizado.iterrows()
+    ]
+    qtd = repo.update_logs_bulk(username, updates)
+    return qtd, novos_projetos, novas_categorias, None
+
+
+@st.dialog("Recalcular Esforço com IA")
+def _dialog_confirmar_recalculo_ia(start_date, end_date):
+    st.write(
+        f"Isso vai **reestimar o esforço (horas)** e **reclassificar projeto/categoria**, "
+        f"via IA, de todos os registros salvos entre **{start_date.strftime('%d/%m/%Y')}** "
+        f"e **{end_date.strftime('%d/%m/%Y')}**. Os valores atuais desses campos serão "
+        f"substituídos pelos sugeridos pela IA."
+    )
+    st.caption("Data, descrição, impedimento e dúvida não são alterados -- só esforço, projeto e categoria.")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Sim, recalcular", type="primary", use_container_width=True):
+            with st.spinner("Consultando IA e recalculando..."):
+                qtd, novos_projetos, novas_categorias, aviso = recalcular_esforco_periodo_com_ia(
+                    _current_user(), start_date, end_date
+                )
+            if aviso:
+                st.session_state["_recalculo_ia_resultado"] = {"tipo": "aviso", "mensagem": aviso}
+            else:
+                st.session_state["_recalculo_ia_resultado"] = {
+                    "tipo": "sucesso", "qtd": qtd, "novos_projetos": novos_projetos, "novas_categorias": novas_categorias,
+                }
+            st.rerun()
+    with col2:
+        if st.button("Cancelar", use_container_width=True):
+            st.rerun()
+
+
 # O PORQUE: opção especial no fim dos dropdowns de Projeto/Categoria dos
 # formulários de Registro/Edição. Ao escolhê-la, um campo de texto aparece
 # na hora para o usuário digitar um nome novo -- que é criado e persistido
@@ -1225,6 +1300,81 @@ with st.sidebar:
 
     with st.expander("🏷️ Novo Nome de Categoria"):
         _manage_options_panel("Categoria", "category", BASE_CATEGORY_OPTIONS, get_category_options)
+
+with st.sidebar:
+    st.markdown("---")
+    st.subheader("🤖 Recalcular Esforço com IA")
+    st.caption("Reprocessa registros já salvos: reestima horas e reclassifica projeto/categoria.")
+
+    if not N8N_AI_ESTIMATE_WEBHOOK_URL:
+        st.caption("Configure `N8N_AI_ESTIMATE_WEBHOOK_URL` nos Secrets para habilitar.")
+    else:
+        # O PORQUE: a aba Dashboard & Relatórios já guarda o período aplicado
+        # em st.session_state.dashboard_start_date/end_date -- por padrão
+        # reaproveitamos esse período (opção mais comum: "recalcula o que eu
+        # já estou vendo"), mas sem obrigar -- desmarcando a caixa, aparece um
+        # date_input próprio aqui na barra lateral pra qualquer outra data,
+        # independente do que estiver filtrado no Dashboard no momento.
+        dash_start = st.session_state.get("dashboard_start_date")
+        dash_end = st.session_state.get("dashboard_end_date")
+
+        usar_periodo_dashboard = st.checkbox(
+            "Usar o período já aplicado no Dashboard",
+            value=True,
+            key="ia_recalc_usar_dashboard",
+        )
+
+        if usar_periodo_dashboard:
+            if dash_start and dash_end:
+                st.caption(f"Período: {dash_start.strftime('%d/%m/%Y')} a {dash_end.strftime('%d/%m/%Y')}")
+                recalc_start, recalc_end = dash_start, dash_end
+            else:
+                st.caption("Nenhum período aplicado ainda na aba Dashboard & Relatórios.")
+                recalc_start, recalc_end = None, None
+        else:
+            c_recalc1, c_recalc2 = st.columns(2)
+            with c_recalc1:
+                recalc_start = st.date_input(
+                    "De", value=dash_start or datetime.today().date(), format="DD/MM/YYYY", key="ia_recalc_start"
+                )
+            with c_recalc2:
+                recalc_end = st.date_input(
+                    "Até", value=dash_end or datetime.today().date(), format="DD/MM/YYYY", key="ia_recalc_end"
+                )
+
+        btn_recalcular_ia = st.button(
+            "🤖 Recalcular com IA",
+            use_container_width=True,
+            key="btn_recalcular_ia",
+            disabled=(recalc_start is None or recalc_end is None),
+            help="Abre uma confirmação antes de aplicar -- nada muda sem você confirmar.",
+        )
+        if btn_recalcular_ia:
+            if recalc_start > recalc_end:
+                st.error("A data inicial não pode ser depois da data final.")
+            else:
+                _dialog_confirmar_recalculo_ia(recalc_start, recalc_end)
+
+        # O PORQUE: o resultado só existe em session_state por UM rerun (o que
+        # acontece logo depois do st.rerun() dentro do diálogo) -- .pop() já
+        # remove na hora de ler, então a mensagem aparece uma vez e não fica
+        # "grudada" reaparecendo em reruns futuros não relacionados.
+        resultado_recalculo = st.session_state.pop("_recalculo_ia_resultado", None)
+        if resultado_recalculo:
+            if resultado_recalculo["tipo"] == "aviso":
+                st.warning(resultado_recalculo["mensagem"])
+            else:
+                msg = f"✅ {resultado_recalculo['qtd']} registro(s) recalculado(s)."
+                novos_p = resultado_recalculo["novos_projetos"]
+                novas_c = resultado_recalculo["novas_categorias"]
+                if novos_p or novas_c:
+                    partes = []
+                    if novos_p:
+                        partes.append(f"projeto(s) {', '.join(novos_p)}")
+                    if novas_c:
+                        partes.append(f"categoria(s) {', '.join(novas_c)}")
+                    msg += f" Adicionado(s) automaticamente: {' e '.join(partes)}."
+                st.success(msg)
 
 st.title("📊 Task Tracker")
 

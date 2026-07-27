@@ -244,6 +244,24 @@ class LogRepository:
         self.conn.commit()
         return len(log_ids)
 
+    def update_logs_bulk(self, username: str, updates: list) -> int:
+        # O PORQUE: usado pela reestimativa de esforço por IA (recalcula
+        # registros JÁ salvos, diferente de insert_logs_bulk que só lida com
+        # linhas novas ainda não gravadas). Mesma lógica de 1 executemany +
+        # 1 commit em vez de 1 commit por linha -- crítico contra o Turso
+        # (cada commit é uma ida-e-volta de rede). Cada item de `updates` é
+        # um dict com as chaves: id, effort_hours, project, category.
+        if not updates:
+            return 0
+        query = "UPDATE work_logs SET effort_hours = ?, project = ?, category = ? WHERE id = ? AND username = ?"
+        tuples_to_update = [
+            (u["effort_hours"], u["project"], u["category"], u["id"], username)
+            for u in updates
+        ]
+        self.conn.executemany(query, tuples_to_update)
+        self.conn.commit()
+        return len(tuples_to_update)
+
     def get_all_logs_as_dataframe(self, username: str) -> pd.DataFrame:
         cursor = self.conn.execute(
             "SELECT * FROM work_logs WHERE username = ? ORDER BY log_date DESC", (username,)
