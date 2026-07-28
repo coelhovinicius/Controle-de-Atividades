@@ -396,29 +396,70 @@ st.markdown(
 # visual extra). Se o testid "stStatusWidget" mudar em versões futuras do
 # Streamlit, este seletor pode parar de funcionar -- nesse caso, confira no
 # DevTools (F12) qual testid o indicador de "running" usa na sua versão.
+# O PORQUE: a versão anterior deste indicador escurecia a tela inteira e
+# bloqueava clique a CADA rerun do Streamlit (mesmo os rapidinhos, <1s),
+# sem nenhuma transição -- fazia até ações rápidas parecerem lentas/pesadas.
+# Troquei pelo padrão "barra de progresso fina no topo" (o mesmo que
+# YouTube/GitHub usam): leve, não bloqueia a tela, e some sozinha quando o
+# rerun termina (a barra só existe enquanto "stStatusWidget" -- o indicador
+# nativo de "processando" do Streamlit -- estiver no DOM).
+#
+# Dois truques pra parecer mais rápido de verdade, não só visualmente:
+# 1) `animation-delay: 150ms` -- a barra fica INVISÍVEL nos primeiros 150ms.
+#    Reruns mais rápidos que isso (a maioria dos cliques neste app) nunca
+#    chegam a mostrar nada -- parecem instantâneos. Só reruns mais lentos
+#    (chamada de IA, consulta grande no Turso) mostram o indicador.
+# 2) `fade-in-leve` -- quando aparece, é com um fade suave (0.2s), não um
+#    "pop" abrupto.
+# ATENÇÃO: como antes, depende do testid "stStatusWidget" (pode mudar em
+# versões futuras do Streamlit -- confira no DevTools se parar de aparecer).
 st.markdown(
     """
     <style>
+    @keyframes barra-progresso-sweep {
+        0%   { background-position: 200% 0; }
+        100% { background-position: -200% 0; }
+    }
+    @keyframes fade-in-leve {
+        from { opacity: 0; }
+        to   { opacity: 1; }
+    }
+
     [data-testid="stStatusWidget"] {
-        transform: scale(1.6);
+        transform: scale(1.15);
         transform-origin: top right;
     }
-    body:has([data-testid="stStatusWidget"]) {
-        cursor: progress;
-    }
-    body:has([data-testid="stStatusWidget"])::after {
-        content: "Carregando, aguarde...";
+
+    body:has([data-testid="stStatusWidget"])::before {
+        content: "";
         position: fixed;
-        inset: 0;
-        background: rgba(0, 0, 0, 0.55);
-        color: white;
-        font-size: 1.8rem;
-        font-weight: 700;
-        display: flex;
-        align-items: center;
-        justify-content: center;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 3px;
+        background: linear-gradient(90deg, transparent, #ff4b4b, transparent);
+        background-size: 60% 100%;
         z-index: 999999;
-        pointer-events: all;
+        pointer-events: none;
+        animation:
+            barra-progresso-sweep 1s linear infinite,
+            fade-in-leve 0.2s ease-in 150ms both;
+    }
+
+    body:has([data-testid="stStatusWidget"])::after {
+        content: "Carregando...";
+        position: fixed;
+        top: 10px;
+        right: 16px;
+        background: rgba(38, 39, 48, 0.92);
+        color: white;
+        font-size: 0.8rem;
+        font-weight: 600;
+        padding: 4px 12px;
+        border-radius: 999px;
+        z-index: 999999;
+        pointer-events: none;
+        animation: fade-in-leve 0.2s ease-in 150ms both;
     }
     </style>
     """,
@@ -746,17 +787,13 @@ def _dialog_confirmar_recalculo_ia(start_date, end_date):
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Sim, recalcular", type="primary", use_container_width=True):
-            with st.spinner("Consultando IA e recalculando..."):
-                qtd, novos_projetos, novas_categorias, aviso = recalcular_esforco_periodo_com_ia(
-                    _current_user(), start_date, end_date
-                )
-            if aviso:
-                st.session_state["_recalculo_ia_resultado"] = {"tipo": "aviso", "mensagem": aviso}
-            else:
-                st.session_state["_recalculo_ia_resultado"] = {
-                    "tipo": "sucesso", "qtd": qtd, "novos_projetos": novos_projetos, "novas_categorias": novas_categorias,
-                }
-            st.rerun()
+            run_blocking_action(
+                "ia_recalcular_periodo",
+                {"start_date": start_date, "end_date": end_date},
+                processing_message="Consultando IA e recalculando...",
+                success_message="✅ Recálculo concluído.",
+                failure_message="⚠️ Não foi possível recalcular.",
+            )
     with col2:
         if st.button("Cancelar", use_container_width=True):
             st.rerun()
@@ -871,6 +908,10 @@ if 'processing_action' not in st.session_state:
 SORTABLE_COLUMNS = {
     "ID": "id",
     "Data": "log_date",
+    "Projeto": "project",
+    "Categoria": "category",
+    "Descrição": "description",
+    "Horas": "effort_hours",
 }
 
 
@@ -938,6 +979,29 @@ def request_confirmation(action_type: str, payload: dict, title: str, message: s
         "processing_message": processing_message,
         "confirm_label": confirm_label,
         "on_cancel_cleanup": on_cancel_cleanup or {},
+    }
+    st.rerun()
+
+
+def run_blocking_action(action_type: str, payload: dict, processing_message: str = "Processando...",
+                         success_message: str = "Concluído.", failure_message: str = "Não foi possível concluir."):
+    # O PORQUE: mesmo bloqueio "nada mais é desenhado nesta execução" do
+    # request_confirmation(), mas SEM o modal de "tem certeza?" antes -- para
+    # ações que não são destrutivas o bastante pra pedir confirmação (ex.:
+    # pedir uma sugestão da IA, analisar um arquivo antes de decidir o que
+    # aplicar), mas que envolvem uma chamada de rede/IA que pode demorar
+    # alguns segundos. Durante esse tempo, a tela inteira (inclusive a
+    # barra lateral e as outras abas) fica bloqueada -- não é só um efeito
+    # visual, é a mesma garantia usada nas ações com confirmação: nenhum
+    # outro widget é renderizado nesta execução, então não existe o que
+    # clicar.
+    st.session_state.processing = True
+    st.session_state.processing_action = {
+        "type": action_type,
+        "payload": payload,
+        "processing_message": processing_message,
+        "success_message": success_message,
+        "failure_message": failure_message,
     }
     st.rerun()
 
@@ -1014,6 +1078,183 @@ def execute_processing_action(action: dict) -> bool:
     elif t == "delete_log":
         repo.delete_log(p["log_id"], username)
         reset_states(full_reset=True)
+        return True
+
+    elif t == "ia_sugerir_registro":
+        # O PORQUE: mesma lógica que já existia inline no botão "Sugerir com
+        # IA", só que agora rodando dentro do bloqueio de tela cheia -- a
+        # chamada de rede pro n8n pode levar alguns segundos, e durante esse
+        # tempo nenhum outro botão do app pode ser clicado.
+        results_ia, erro_ia = estimar_esforco_com_ia(
+            [{"id": 0, "description": p["descricao"]}], get_project_options(), get_category_options(),
+        )
+        if erro_ia:
+            action["failure_message"] = f"⚠️ Não foi possível consultar a IA agora ({erro_ia})."
+            return False
+
+        r = results_ia[0] if results_ia else {}
+        minutes = r.get("estimated_minutes")
+        project_sugerido = (r.get("project") or "").strip()
+        category_sugerida = (r.get("category") or "").strip()
+        if project_sugerido and r.get("is_new_project"):
+            repo.add_custom_option("project", username, project_sugerido)
+        if category_sugerida and r.get("is_new_category"):
+            repo.add_custom_option("category", username, category_sugerida)
+        # O PORQUE: mesmo raciocínio de antes -- não dá pra escrever direto
+        # nas keys dos widgets (add_effort/add_proj_select/add_cat_select)
+        # aqui, porque esta função roda ANTES do próximo rerun desenhar o
+        # formulário; guardamos como "pendente" e o topo do formulário
+        # aplica no próximo desenho (ver bloco antes dos widgets do "Novo
+        # Registro").
+        st.session_state["_ia_sugestao_pendente"] = {
+            "effort_hours": round(minutes / 60.0, 2) if isinstance(minutes, (int, float)) and minutes > 0 else None,
+            "project": project_sugerido or None,
+            "category": category_sugerida or None,
+        }
+        return True
+
+    elif t == "ia_recalcular_periodo":
+        # O PORQUE: mesma lógica que já existia inline no diálogo "Recalcular
+        # Esforço com IA", agora rodando dentro do bloqueio de tela cheia --
+        # essa é a ação mais demorada de todas (chama a IA para CADA registro
+        # do período), então é a que mais se beneficia de travar a tela
+        # inteira enquanto processa.
+        qtd, novos_projetos, novas_categorias, aviso = recalcular_esforco_periodo_com_ia(
+            username, p["start_date"], p["end_date"]
+        )
+        if aviso:
+            st.session_state["_recalculo_ia_resultado"] = {"tipo": "aviso", "mensagem": aviso}
+            action["failure_message"] = f"⚠️ {aviso}"
+            return False
+        st.session_state["_recalculo_ia_resultado"] = {
+            "tipo": "sucesso", "qtd": qtd, "novos_projetos": novos_projetos, "novas_categorias": novas_categorias,
+        }
+        return True
+
+    elif t == "ia_analisar_arquivo":
+        # O PORQUE: mesma lógica que já existia inline no botão "Analisar
+        # Arquivo Enviado" -- ver payload montado no botão (raw_bytes,
+        # file_ext, file_name), já que o widget de upload em si não existe
+        # mais nesta execução (bloqueio de tela cheia).
+        raw_bytes = p["raw_bytes"]
+        file_ext = p["file_ext"]
+        file_name = p["file_name"]
+        parser = HistoryParser()
+
+        if file_ext == ".csv":
+            df_txt = parser.parse_csv(raw_bytes)
+            if df_txt.empty:
+                action["failure_message"] = (
+                    "Não foi possível reconhecer as colunas do CSV. Esperado: "
+                    "log_date;project;category;description;effort_hours "
+                    "(ou separado por vírgula, no padrão US)."
+                )
+                return False
+        else:
+            raw_text = raw_bytes.decode("utf-8", errors="replace")
+            df_txt = parser.parse_text(raw_text)
+
+        df_db = repo.get_all_logs_as_dataframe(username)
+
+        # O PORQUE: normaliza is_impedimento/is_duvida para o mesmo tipo
+        # (int 0/1) dos dois lados antes do merge -- df_db vem do SQLite
+        # como int64, df_txt vem do parser como bool. Se os dtypes não
+        # baterem, o merge por essas colunas nunca dá match e todo
+        # registro pareceria "novo", mesmo já existindo.
+        COMPARE_COLUMNS = ["log_date", "project", "category", "description", "effort_hours", "is_impedimento", "is_duvida"]
+        if not df_txt.empty:
+            df_txt["is_impedimento"] = df_txt["is_impedimento"].astype(int)
+            df_txt["is_duvida"] = df_txt["is_duvida"].astype(int)
+
+        # O PORQUE: Manipulação via Pandas Merge para identificar Deltas (Insertions vs Deletions) mantendo a performance de O(N).
+        if not df_db.empty:
+            df_db_comp = df_db.drop(columns=["id", "created_at"])
+            df_db_comp["is_impedimento"] = df_db_comp["is_impedimento"].astype(int)
+            df_db_comp["is_duvida"] = df_db_comp["is_duvida"].astype(int)
+        else:
+            df_db_comp = pd.DataFrame(columns=COMPARE_COLUMNS)
+
+        if not df_txt.empty:
+            df_merged = df_txt.merge(df_db_comp, on=COMPARE_COLUMNS, how='outer', indicator=True)
+
+            df_to_insert = df_merged[df_merged['_merge'] == 'left_only'].drop(columns=['_merge']).copy()
+            df_to_delete_comp = df_merged[df_merged['_merge'] == 'right_only'].drop(columns=['_merge']).copy()
+
+            if not df_to_delete_comp.empty:
+                df_to_delete = df_db.merge(df_to_delete_comp, on=COMPARE_COLUMNS, how='inner')
+            else:
+                df_to_delete = pd.DataFrame()
+        else:
+            df_to_insert = pd.DataFrame()
+            df_to_delete = df_db.copy()
+
+        df_to_insert.insert(0, "_Aplicar", True)
+        if not df_to_delete.empty:
+            df_to_delete.insert(0, "_Aplicar", True)
+
+        ia_aviso = None
+        novos_projetos, novas_categorias = [], []
+        if N8N_AI_ESTIMATE_WEBHOOK_URL and not df_to_insert.empty:
+            df_to_insert, novos_projetos, novas_categorias, ia_aviso = aplicar_estimativa_ia_e_normalizacao(df_to_insert)
+            if not ia_aviso:
+                for proj in novos_projetos:
+                    repo.add_custom_option("project", username, proj)
+                for cat in novas_categorias:
+                    repo.add_custom_option("category", username, cat)
+
+        st.session_state.df_to_insert = df_to_insert
+        st.session_state.df_to_delete = df_to_delete
+        st.session_state.sync_analyzed = True
+        st.session_state.sync_file_name = file_name
+        # O PORQUE: st.info/st.warning chamados AQUI DENTRO não apareceriam
+        # pro usuário -- ficam atrás do overlay de tela cheia e somem no
+        # rerun automático logo em seguida. Guardamos como resultado
+        # pendente, exibido depois (ver logo após "if
+        # st.session_state.sync_analyzed:"), já com a tela de revisão
+        # normal desenhada por cima.
+        st.session_state["_analise_arquivo_ia_info"] = {
+            "ia_aviso": ia_aviso,
+            "novos_projetos": novos_projetos,
+            "novas_categorias": novas_categorias,
+        }
+        return True
+
+    elif t == "ia_sincronizar":
+        # O PORQUE: mesma lógica que já existia inline no botão
+        # "Sincronizar" -- edited_insert/edited_delete vêm prontos no
+        # payload (capturados do data_editor antes deste bloqueio), já que
+        # os widgets em si não existem mais nesta execução.
+        edited_insert = p["edited_insert"]
+        edited_delete = p["edited_delete"]
+        records_inserted = 0
+        records_deleted = 0
+
+        if not edited_insert.empty:
+            to_insert = edited_insert[edited_insert["_Aplicar"] == True]
+            rows_to_insert = []
+            for _, row in to_insert.iterrows():
+                # O PORQUE: DateColumn pode devolver datetime.date (ou
+                # Timestamp) em vez de string ao ler o data_editor de volta;
+                # normalizamos para ISO (YYYY-MM-DD) antes de gravar, que é
+                # o formato esperado pela coluna log_date no SQLite.
+                log_date_iso = row["log_date"].strftime("%Y-%m-%d") if hasattr(row["log_date"], "strftime") else str(row["log_date"])
+                rows_to_insert.append({
+                    "log_date": log_date_iso,
+                    "project": row["project"],
+                    "category": row["category"],
+                    "description": row["description"],
+                    "effort_hours": row["effort_hours"],
+                    "is_impedimento": bool(row.get("is_impedimento", False)),
+                    "is_duvida": bool(row.get("is_duvida", False)),
+                })
+            records_inserted = repo.insert_logs_bulk(username, rows_to_insert)
+
+        if not edited_delete.empty:
+            to_delete = edited_delete[edited_delete["_Aplicar"] == True]
+            records_deleted = repo.delete_logs_bulk(username, to_delete["id"].tolist())
+
+        st.session_state.sync_analyzed = False
+        action["success_message"] = f"Prontinho! {records_inserted} registro(s) adicionado(s) e {records_deleted} removido(s)."
         return True
 
     return True
@@ -1410,10 +1651,54 @@ with tab_manage:
                 reset_states(full_reset=False)
                 st.rerun()
 
-        df_all = repo.get_all_logs_as_dataframe(_current_user())
+        # O PORQUE: antes, esta tela trazia o histórico INTEIRO do usuário a
+        # cada abertura (get_all_logs_as_dataframe sem filtro nenhum) -- caro
+        # contra um banco remoto (Turso) à medida que o histórico cresce.
+        # Agora, filtra o período já na consulta SQL. Padrão: sempre "1 mês
+        # de calendário atrás até hoje", calculado na hora (nunca uma data
+        # travada) -- e, uma vez que o usuário aplicar outro período, ele
+        # se mantém (mesmo padrão da aba Dashboard) até ser trocado de novo.
+        hoje_grid = datetime.today().date()
+        default_grid_start = hoje_grid - timedelta(days=10)
+
+        with st.form("grid_filter_form"):
+            st.markdown("##### Período")
+            c_gstart, c_gend = st.columns(2)
+            with c_gstart:
+                grid_start_input = st.date_input(
+                    "Data Inicial",
+                    value=st.session_state.get("grid_start_date", default_grid_start),
+                    format="DD/MM/YYYY",
+                )
+            with c_gend:
+                grid_end_input = st.date_input(
+                    "Data Final",
+                    value=st.session_state.get("grid_end_date", hoje_grid),
+                    format="DD/MM/YYYY",
+                )
+            grid_apply = st.form_submit_button("Aplicar Filtro", type="primary")
+
+        if grid_apply:
+            if grid_start_input > grid_end_input:
+                st.error("A Data Inicial não pode ser depois da Data Final.")
+            else:
+                st.session_state.grid_start_date = grid_start_input
+                st.session_state.grid_end_date = grid_end_input
+                st.session_state.current_page = 1
+
+        grid_start_date = st.session_state.get("grid_start_date", default_grid_start)
+        grid_end_date = st.session_state.get("grid_end_date", hoje_grid)
+
+        df_all = repo.get_logs_as_dataframe_by_range(
+            _current_user(), grid_start_date.isoformat(), grid_end_date.isoformat()
+        )
 
         if df_all.empty:
-            st.info("Você ainda não tem nenhum registro cadastrado. Clique em **Novo Registro** para começar.")
+            st.info(
+                f"Nenhum registro entre **{grid_start_date.strftime('%d/%m/%Y')}** e "
+                f"**{grid_end_date.strftime('%d/%m/%Y')}**. Ajuste o período acima "
+                "ou clique em **Novo Registro** para começar."
+            )
         else:
             col_search, col_clear = st.columns([4, 1])
             with col_search:
@@ -1604,36 +1889,13 @@ with tab_manage:
             if not desc_atual:
                 st.warning("Escreva a descrição da atividade antes de pedir uma sugestão.")
             else:
-                with st.spinner("Consultando IA..."):
-                    results_ia, erro_ia = estimar_esforco_com_ia(
-                        [{"id": 0, "description": desc_atual}], get_project_options(), get_category_options(),
-                    )
-                if erro_ia:
-                    st.warning(f"⚠️ Não foi possível consultar a IA agora ({erro_ia}).")
-                else:
-                    r = results_ia[0] if results_ia else {}
-                    minutes = r.get("estimated_minutes")
-                    project_sugerido = (r.get("project") or "").strip()
-                    category_sugerida = (r.get("category") or "").strip()
-                    if project_sugerido and r.get("is_new_project"):
-                        repo.add_custom_option("project", _current_user(), project_sugerido)
-                    if category_sugerida and r.get("is_new_category"):
-                        repo.add_custom_option("category", _current_user(), category_sugerida)
-                    # O PORQUE: NÃO escrevemos em st.session_state["add_effort"]/
-                    # ["add_proj_select"]/["add_cat_select"] AQUI -- esses
-                    # widgets já foram instanciados mais acima, nesta mesma
-                    # execução, e o Streamlit barra essa escrita com uma
-                    # exceção na hora (StreamlitAPIException). Em vez disso,
-                    # guardamos a sugestão como "pendente" e disparamos
-                    # st.rerun() -- no PRÓXIMO run, o bloco no topo do
-                    # formulário (antes dos widgets serem criados) aplica esses
-                    # valores de verdade.
-                    st.session_state["_ia_sugestao_pendente"] = {
-                        "effort_hours": round(minutes / 60.0, 2) if isinstance(minutes, (int, float)) and minutes > 0 else None,
-                        "project": project_sugerido or None,
-                        "category": category_sugerida or None,
-                    }
-                    st.rerun()
+                run_blocking_action(
+                    "ia_sugerir_registro",
+                    {"descricao": desc_atual},
+                    processing_message="Consultando IA...",
+                    success_message="🤖 Sugestão aplicada.",
+                    failure_message="⚠️ Não foi possível consultar a IA agora.",
+                )
 
         col_imp, col_duv = st.columns(2)
         with col_imp:
@@ -2064,7 +2326,7 @@ with tab_dashboard:
         # acesso. Limitamos (clamp) entre a data mais antiga e a mais recente
         # que existem no banco, para o filtro já nascer válido mesmo que o
         # histórico seja mais curto que 30 dias ou não tenha dado recente.
-        default_start_date = today - timedelta(days=30)
+        default_start_date = today - timedelta(days=10)
         default_start_date = max(default_start_date, min_db_date)
         default_start_date = min(default_start_date, max_db_date)
 
@@ -2552,103 +2814,46 @@ with tab_sync:
         )
 
     if st.button("Analisar Arquivo Enviado", type="primary", disabled=(uploaded_file is None or upload_too_large)):
-        with st.spinner("Comparando com os registros salvos..."):
-            raw_bytes = uploaded_file.read()
-            file_ext = os.path.splitext(uploaded_file.name)[1].lower()
-            parser = HistoryParser()
-
-            if file_ext == ".csv":
-                df_txt = parser.parse_csv(raw_bytes)
-                if df_txt.empty:
-                    st.error(
-                        "Não foi possível reconhecer as colunas do CSV. Esperado: "
-                        "log_date;project;category;description;effort_hours "
-                        "(ou separado por vírgula, no padrão US)."
-                    )
-            else:
-                raw_text = raw_bytes.decode("utf-8", errors="replace")
-                df_txt = parser.parse_text(raw_text)
-
-            df_db = repo.get_all_logs_as_dataframe(_current_user())
-
-            # O PORQUE: normaliza is_impedimento/is_duvida para o mesmo tipo
-            # (int 0/1) dos dois lados antes do merge -- df_db vem do SQLite
-            # como int64, df_txt vem do parser como bool. Se os dtypes não
-            # baterem, o merge por essas colunas nunca dá match e todo
-            # registro pareceria "novo", mesmo já existindo.
-            COMPARE_COLUMNS = ["log_date", "project", "category", "description", "effort_hours", "is_impedimento", "is_duvida"]
-            if not df_txt.empty:
-                df_txt["is_impedimento"] = df_txt["is_impedimento"].astype(int)
-                df_txt["is_duvida"] = df_txt["is_duvida"].astype(int)
-
-            # O PORQUE: Manipulação via Pandas Merge para identificar Deltas (Insertions vs Deletions) mantendo a performance de O(N).
-            if not df_db.empty:
-                df_db_comp = df_db.drop(columns=["id", "created_at"])
-                df_db_comp["is_impedimento"] = df_db_comp["is_impedimento"].astype(int)
-                df_db_comp["is_duvida"] = df_db_comp["is_duvida"].astype(int)
-            else:
-                df_db_comp = pd.DataFrame(columns=COMPARE_COLUMNS)
-
-            if not df_txt.empty:
-                df_merged = df_txt.merge(df_db_comp, on=COMPARE_COLUMNS, how='outer', indicator=True)
-
-                df_to_insert = df_merged[df_merged['_merge'] == 'left_only'].drop(columns=['_merge']).copy()
-                df_to_delete_comp = df_merged[df_merged['_merge'] == 'right_only'].drop(columns=['_merge']).copy()
-
-                # Recupera os IDs para remoção exata
-                if not df_to_delete_comp.empty:
-                    df_to_delete = df_db.merge(df_to_delete_comp, on=COMPARE_COLUMNS, how='inner')
-                else:
-                    df_to_delete = pd.DataFrame()
-            else:
-                df_to_insert = pd.DataFrame()
-                df_to_delete = df_db.copy()
-
-            df_to_insert.insert(0, "_Aplicar", True)
-
-            if not df_to_delete.empty:
-                df_to_delete.insert(0, "_Aplicar", True)
-
-            # O PORQUE: só tenta a estimativa por IA se houver N8N_AI_ESTIMATE_WEBHOOK_URL
-            # configurado -- sem isso, df_to_insert segue exatamente como antes (esforço
-            # flat de 1h + classificação por palavra-chave do importer_core.py). Com IA
-            # configurada, sobrescreve effort_hours/project/category linha a linha,
-            # detecta dias de OVERTIME/plantão e normaliza o total de cada dia comum
-            # pra ~8h (dias de plantão ficam sem teto, com a soma crua da IA).
-            ia_aviso = None
-            novos_projetos, novas_categorias = [], []
-            if N8N_AI_ESTIMATE_WEBHOOK_URL and not df_to_insert.empty:
-                with st.spinner("Estimando duração e classificando com IA..."):
-                    df_to_insert, novos_projetos, novas_categorias, ia_aviso = aplicar_estimativa_ia_e_normalizacao(df_to_insert)
-
-                if ia_aviso:
-                    st.warning(
-                        f"⚠️ Não foi possível usar a estimativa por IA agora ({ia_aviso}). "
-                        "Os registros abaixo seguem com esforço fixo (1h) e classificação "
-                        "por palavra-chave, como antes -- revise/ajuste manualmente se precisar."
-                    )
-                else:
-                    for proj in novos_projetos:
-                        repo.add_custom_option("project", _current_user(), proj)
-                    for cat in novas_categorias:
-                        repo.add_custom_option("category", _current_user(), cat)
-                    if novos_projetos or novas_categorias:
-                        partes = []
-                        if novos_projetos:
-                            partes.append(f"projeto(s) **{', '.join(novos_projetos)}**")
-                        if novas_categorias:
-                            partes.append(f"categoria(s) **{', '.join(novas_categorias)}**")
-                        st.info(f"🤖 IA aplicada. Adicionado(s) automaticamente: {' e '.join(partes)}.")
-                    else:
-                        st.info("🤖 Estimativa de esforço e classificação por IA aplicada.")
-
-            st.session_state.df_to_insert = df_to_insert
-            st.session_state.df_to_delete = df_to_delete
-            st.session_state.sync_analyzed = True
-            st.session_state.sync_file_name = uploaded_file.name
+        # O PORQUE: só capturamos os bytes/nome do arquivo aqui (enquanto o
+        # widget uploaded_file ainda existe nesta execução) e delegamos o
+        # processamento pesado (parse + comparação + IA) pro dispatcher --
+        # durante o bloqueio de tela cheia, NENHUM widget é redesenhado
+        # (nem o próprio uploader), então tudo que for necessário precisa
+        # estar dentro do payload, não em variáveis/widgets locais.
+        raw_bytes = uploaded_file.read()
+        file_ext = os.path.splitext(uploaded_file.name)[1].lower()
+        run_blocking_action(
+            "ia_analisar_arquivo",
+            {"raw_bytes": raw_bytes, "file_ext": file_ext, "file_name": uploaded_file.name},
+            processing_message="Comparando com os registros salvos...",
+            success_message="Análise concluída.",
+            failure_message="Não foi possível analisar o arquivo.",
+        )
 
     if st.session_state.sync_analyzed:
         st.markdown("---")
+
+        # O PORQUE: resultado da estimativa por IA (calculado durante o
+        # bloqueio de tela cheia, onde st.warning/st.info não apareceriam
+        # pro usuário) -- exibido aqui, na primeira renderização normal
+        # depois da análise. .pop() garante que só aparece uma vez.
+        analise_ia_info = st.session_state.pop("_analise_arquivo_ia_info", None)
+        if analise_ia_info:
+            if analise_ia_info["ia_aviso"]:
+                st.warning(
+                    f"⚠️ Não foi possível usar a estimativa por IA agora ({analise_ia_info['ia_aviso']}). "
+                    "Os registros abaixo seguem com esforço fixo (1h) e classificação "
+                    "por palavra-chave, como antes -- revise/ajuste manualmente se precisar."
+                )
+            elif analise_ia_info["novos_projetos"] or analise_ia_info["novas_categorias"]:
+                partes = []
+                if analise_ia_info["novos_projetos"]:
+                    partes.append(f"projeto(s) **{', '.join(analise_ia_info['novos_projetos'])}**")
+                if analise_ia_info["novas_categorias"]:
+                    partes.append(f"categoria(s) **{', '.join(analise_ia_info['novas_categorias'])}**")
+                st.info(f"🤖 IA aplicada. Adicionado(s) automaticamente: {' e '.join(partes)}.")
+            elif N8N_AI_ESTIMATE_WEBHOOK_URL:
+                st.info("🤖 Estimativa de esforço e classificação por IA aplicada.")
 
         edited_insert = pd.DataFrame()
         edited_delete = pd.DataFrame()
@@ -2723,47 +2928,10 @@ with tab_sync:
             if confirm_text != expected_name:
                 st.error("Nome do arquivo incorreto. Tente novamente.")
             else:
-                records_inserted = 0
-                records_deleted = 0
-
-                # O PORQUE: antes, este bloco chamava repo.insert_log()/
-                # delete_log() um registro por vez dentro de um for -- cada
-                # chamada dá commit imediatamente, e contra um banco REMOTO
-                # (Turso) isso significa 1 ida-e-volta de rede POR LINHA.
-                # Sincronizar um raw_history.txt com milhares de linhas
-                # chegava a levar minutos (parecendo travado, sem estar).
-                # Trocado para montar a lista inteira em memória e mandar
-                # tudo de uma vez via insert_logs_bulk()/delete_logs_bulk()
-                # -- 1 (ou pertinho disso) round-trip no total, não um por
-                # linha. O tempo de uma sincronização grande cai de minutos
-                # para segundos.
-                if not edited_insert.empty:
-                    to_insert = edited_insert[edited_insert["_Aplicar"] == True]
-                    sync_username = _current_user()
-                    rows_to_insert = []
-                    for _, row in to_insert.iterrows():
-                        # O PORQUE: DateColumn pode devolver datetime.date (ou
-                        # Timestamp) em vez de string ao ler o data_editor de volta;
-                        # normalizamos para ISO (YYYY-MM-DD) antes de gravar, que é
-                        # o formato esperado pela coluna log_date no SQLite.
-                        log_date_iso = row["log_date"].strftime("%Y-%m-%d") if hasattr(row["log_date"], "strftime") else str(row["log_date"])
-                        rows_to_insert.append({
-                            "log_date": log_date_iso,
-                            "project": row["project"],
-                            "category": row["category"],
-                            "description": row["description"],
-                            "effort_hours": row["effort_hours"],
-                            "is_impedimento": bool(row.get("is_impedimento", False)),
-                            "is_duvida": bool(row.get("is_duvida", False)),
-                        })
-                    records_inserted = repo.insert_logs_bulk(sync_username, rows_to_insert)
-
-                if not edited_delete.empty:
-                    to_delete = edited_delete[edited_delete["_Aplicar"] == True]
-                    sync_username = _current_user()
-                    records_deleted = repo.delete_logs_bulk(sync_username, to_delete["id"].tolist())
-
-                st.session_state.sync_analyzed = False
-                st.success(f"Prontinho! {records_inserted} registro(s) adicionado(s) e {records_deleted} removido(s).")
-                time.sleep(2)
-                st.rerun()
+                run_blocking_action(
+                    "ia_sincronizar",
+                    {"edited_insert": edited_insert, "edited_delete": edited_delete},
+                    processing_message="Sincronizando registros...",
+                    success_message="Sincronização concluída.",
+                    failure_message="Não foi possível sincronizar.",
+                )

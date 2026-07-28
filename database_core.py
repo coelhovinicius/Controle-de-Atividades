@@ -272,3 +272,23 @@ class LogRepository:
         except Exception:
             columns = WORK_LOGS_COLUMNS
         return pd.DataFrame(rows, columns=columns)
+
+    def get_logs_as_dataframe_by_range(self, username: str, start_date: str, end_date: str) -> pd.DataFrame:
+        # O PORQUE: mesma coisa que get_all_logs_as_dataframe, mas filtrando
+        # o período já na consulta SQL (WHERE log_date BETWEEN ...) -- usado
+        # pela aba Registro de Atividades, para não precisar trazer o
+        # histórico inteiro pela rede a cada abertura da tela (importante
+        # contra o Turso, onde cada consulta é uma ida-e-volta de rede;
+        # trazer só o período pedido é bem mais leve que trazer tudo e
+        # filtrar depois em pandas). start_date/end_date no formato
+        # "YYYY-MM-DD" (mesmo formato salvo em log_date).
+        cursor = self.conn.execute(
+            "SELECT * FROM work_logs WHERE username = ? AND log_date >= ? AND log_date <= ? ORDER BY log_date DESC",
+            (username, start_date, end_date),
+        )
+        rows = cursor.fetchall()
+        try:
+            columns = [d[0] for d in cursor.description]
+        except Exception:
+            columns = WORK_LOGS_COLUMNS
+        return pd.DataFrame(rows, columns=columns)
