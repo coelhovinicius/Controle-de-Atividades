@@ -114,6 +114,14 @@ SESSION_TTL_HOURS = 12
 # e cole o resultado em SESSION_SECRET_KEY nos Secrets.
 SESSION_SECRET_KEY = os.environ.get("SESSION_SECRET_KEY", "").strip() or pysecrets.token_urlsafe(32)
 
+# O PORQUE: quando um convidado entra pelo link de acesso aprovado, ele
+# precisa ver os dados de alguém -- não os dele mesmo (convidado não tem
+# work_logs próprios). Esta chave diz qual username (de [credentials]) é
+# "o dono dos dados" que os convidados enxergam. Sem ela configurada, o
+# fluxo de convidado fica desativado (não tem como saber de quem mostrar
+# os dados).
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "").strip()
+
 # O PORQUE: tokens revogados explicitamente (botão "Sair") antes do prazo
 # natural de expiração. O token em si já é auto-verificável (HMAC) e não
 # depende desta lista pra ser considerado válido -- ela só serve pra
@@ -254,12 +262,37 @@ def _dialog_confirmar_logout():
             st.rerun()
 
 
+def _dialog_confirmar_solicitacao(nome: str, email: str, justificativa: str):
+    @st.dialog("Confirmar solicitação de acesso")
+    def _inner():
+        st.write(f"Confirma o envio da solicitação de acesso para **{nome}** ({email})?")
+        st.caption("Um administrador vai revisar e aprovar (ou não) o seu pedido.")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Sim, enviar", type="primary", use_container_width=True):
+                repo.create_access_request(nome, email, justificativa)
+                st.session_state["_solicitacao_enviada"] = True
+                st.rerun()
+        with col2:
+            if st.button("Cancelar", use_container_width=True):
+                st.rerun()
+    _inner()
+
+
 def _tela_login():
     st.write("")
     st.write("")
     col_a, col_b, col_c = st.columns([1, 1.1, 1])
     with col_b:
         st.title("📊 Task Tracker")
+
+        guest_link_invalido = st.session_state.pop("_guest_link_invalido", False)
+        if guest_link_invalido:
+            st.error(
+                "Este link de convidado não é válido ou o acesso foi revogado. "
+                "Solicite um novo acesso abaixo, se precisar."
+            )
+
         st.subheader("Acesso restrito")
         with st.form("login_form"):
             username = st.text_input("Usuário")
@@ -274,10 +307,41 @@ def _tela_login():
                 st.session_state.authenticated = True
                 st.session_state.auth_username = username
                 st.session_state.auth_token = token
+                st.session_state.user_role = "admin"
                 st.query_params["s"] = token
                 st.rerun()
             else:
                 st.error("Usuário ou senha incorretos.")
+
+        # O PORQUE: em vez de compartilhar uma senha fixa de "convidado" com
+        # qualquer pessoa (o que era o modelo antigo), quem não tem
+        # usuário/senha pede acesso aqui -- fica pendente até um admin
+        # aprovar manualmente na área administrativa (barra lateral).
+        st.markdown("---")
+        if st.session_state.pop("_solicitacao_enviada", False):
+            st.success("✅ Solicitação enviada! Aguarde a aprovação de um administrador.")
+        with st.expander("Não tem acesso? Solicitar acesso de convidado"):
+            if not ADMIN_USERNAME:
+                st.caption("Solicitação de acesso desativada no momento (não configurada pelo administrador).")
+            else:
+                with st.form("access_request_form", clear_on_submit=True):
+                    req_nome = st.text_input("Nome")
+                    req_email = st.text_input("E-mail")
+                    req_justificativa = st.text_area("Por que você precisa de acesso?")
+                    req_enviar = st.form_submit_button("Enviar Solicitação", use_container_width=True)
+
+                if req_enviar:
+                    email_normalizado = (req_email or "").strip().lower()
+                    if not req_nome.strip() or not email_normalizado or not req_justificativa.strip():
+                        st.error("Preencha nome, e-mail e justificativa.")
+                    elif "@" not in email_normalizado or "." not in email_normalizado.split("@")[-1]:
+                        st.error("Digite um e-mail válido.")
+                    elif repo.get_active_access_request_by_email(email_normalizado):
+                        st.error("Já existe uma solicitação ativa com esse e-mail. Aguarde a análise.")
+                    elif repo.count_active_access_requests() >= 5:
+                        st.error("Não há mais solicitações disponíveis no momento. Tente novamente mais tarde.")
+                    else:
+                        _dialog_confirmar_solicitacao(req_nome.strip(), email_normalizado, req_justificativa.strip())
 
 
 if "authenticated" not in st.session_state:
@@ -294,6 +358,35 @@ if "authenticated" not in st.session_state:
             st.session_state.authenticated = True
             st.session_state.auth_username = qp_username
             st.session_state.auth_token = qp_token
+            st.session_state.user_role = "admin"
+
+    # O PORQUE: mesma ideia do "?s=", mas para o link de convidado
+    # (?g=<token>) -- em vez de validar por assinatura (HMAC), checa AO VIVO
+    # no banco se aquele token ainda corresponde a uma solicitação com
+    # status 'approved'. É isso que permite revogar o acesso de um
+    # convidado instantaneamente (rejeitar/excluir o pedido na área admin),
+    # sem esperar nenhum prazo expirar.
+    if not st.session_state.authenticated:
+        qp_guest_token = st.query_params.get("g")
+        if qp_guest_token:
+            if not ADMIN_USERNAME:
+                st.session_state["_guest_link_invalido"] = True
+            else:
+                guest_info = repo.get_access_request_by_token(qp_guest_token)
+                if guest_info:
+                    st.session_state.authenticated = True
+                    # O PORQUE: usamos o username do ADMIN aqui de propósito --
+                    # é de quem são os dados que o convidado deve enxergar
+                    # (work_logs são gravados por username, e o convidado não
+                    # tem os seus próprios). A identidade real do convidado
+                    # fica em guest_name/guest_email, só para exibição.
+                    st.session_state.auth_username = ADMIN_USERNAME
+                    st.session_state.user_role = "guest"
+                    st.session_state.guest_name = guest_info["name"]
+                    st.session_state.guest_email = guest_info["email"]
+                    st.session_state.guest_token = qp_guest_token
+                else:
+                    st.session_state["_guest_link_invalido"] = True
 
 if not st.session_state.authenticated:
     _tela_login()
@@ -799,6 +892,84 @@ def _dialog_confirmar_recalculo_ia(start_date, end_date):
             st.rerun()
 
 
+@st.dialog("Revogar acesso")
+def _dialog_confirmar_revogar_acesso(request_id: int, nome: str):
+    st.write(
+        f"Revogar o acesso de **{nome}**? O link que foi compartilhado com essa "
+        "pessoa deixa de funcionar imediatamente."
+    )
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Sim, revogar", type="primary", use_container_width=True):
+            repo.reject_access_request(request_id)
+            st.rerun()
+    with col2:
+        if st.button("Cancelar", use_container_width=True):
+            st.rerun()
+
+
+@st.dialog("Excluir solicitação")
+def _dialog_confirmar_excluir_solicitacao(request_id: int, nome: str):
+    st.write(f"Excluir permanentemente a solicitação de **{nome}**? Esta ação não pode ser desfeita.")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Sim, excluir", type="primary", use_container_width=True):
+            repo.delete_access_request(request_id)
+            st.rerun()
+    with col2:
+        if st.button("Cancelar", use_container_width=True):
+            st.rerun()
+
+
+def render_admin_solicitacoes():
+    # O PORQUE: área administrativa própria (não é mais uma aba) -- some o
+    # resto do app enquanto estiver aberta, evitando misturar a tela de
+    # administração com as abas normais de trabalho.
+    st.header("🔐 Solicitações de Acesso de Convidado")
+    if st.button("← Voltar para o app"):
+        st.session_state.mostrar_admin_solicitacoes = False
+        st.rerun()
+
+    df_reqs = repo.list_access_requests()
+    ativas = 0 if df_reqs.empty else int((df_reqs["status"].isin(["pending", "approved"])).sum())
+    st.caption(f"{ativas} de 5 vagas ativas em uso (pendentes + aprovadas).")
+
+    if df_reqs.empty:
+        st.info("Nenhuma solicitação recebida ainda.")
+        return
+
+    status_labels = {"pending": "🟡 Pendente", "approved": "🟢 Aprovado", "rejected": "🔴 Rejeitado/Revogado"}
+
+    for _, row in df_reqs.iterrows():
+        request_id = int(row["id"])
+        with st.container(border=True):
+            c_info, c_acoes = st.columns([3, 1])
+            with c_info:
+                st.markdown(f"**{row['name']}** — {row['email']}")
+                st.caption(f"{status_labels.get(row['status'], row['status'])} • solicitado em {row['requested_at']}")
+                if row["justification"]:
+                    st.caption(f"Justificativa: {row['justification']}")
+                if row["status"] == "approved" and row["access_token"]:
+                    st.code(f"?g={row['access_token']}", language=None)
+                    st.caption(
+                        "Copie e adicione ao final da URL do seu app (ex.: "
+                        "`https://seu-app.streamlit.app/?g=...`) e mande para o convidado."
+                    )
+            with c_acoes:
+                if row["status"] == "pending":
+                    if st.button("✅ Aprovar", key=f"aprovar_{request_id}", use_container_width=True):
+                        repo.approve_access_request(request_id)
+                        st.rerun()
+                    if st.button("❌ Rejeitar", key=f"rejeitar_{request_id}", use_container_width=True):
+                        repo.reject_access_request(request_id)
+                        st.rerun()
+                elif row["status"] == "approved":
+                    if st.button("🚫 Revogar", key=f"revogar_{request_id}", use_container_width=True):
+                        _dialog_confirmar_revogar_acesso(request_id, row["name"])
+                if st.button("🗑️ Excluir", key=f"excluir_{request_id}", use_container_width=True):
+                    _dialog_confirmar_excluir_solicitacao(request_id, row["name"])
+
+
 # O PORQUE: opção especial no fim dos dropdowns de Projeto/Categoria dos
 # formulários de Registro/Edição. Ao escolhê-la, um campo de texto aparece
 # na hora para o usuário digitar um nome novo -- que é criado e persistido
@@ -882,10 +1053,12 @@ if 'sync_file_name' not in st.session_state:
     st.session_state.sync_file_name = "raw_history.txt"
 # O PORQUE: guarda qual coluna da tabela (ID, Data, Projeto ou Categoria) e em
 # qual direção (asc/desc) o usuário escolheu ordenar, clicando no cabeçalho.
+# Padrão: ID descendente (registro mais recente cadastrado primeiro) -- o
+# usuário pode clicar em qualquer cabeçalho pra mudar isso a qualquer momento.
 if 'sort_column' not in st.session_state:
-    st.session_state.sort_column = None
+    st.session_state.sort_column = "id"
 if 'sort_ascending' not in st.session_state:
-    st.session_state.sort_ascending = True
+    st.session_state.sort_ascending = False
 if 'daily_report' not in st.session_state:
     st.session_state.daily_report = None
 # O PORQUE: sistema genérico de confirmação + "processando" usado por todas
@@ -1528,103 +1701,143 @@ def _manage_options_panel(label_singular: str, option_type: str, base_options: l
 
 
 with st.sidebar:
-    st.caption(f"Logado como **{st.session_state.get('auth_username', '')}**")
+    is_admin = st.session_state.get("user_role") == "admin"
+    if is_admin:
+        st.caption(f"Logado como **{st.session_state.get('auth_username', '')}**")
+    else:
+        st.caption(f"👁️ Convidado (somente leitura): **{st.session_state.get('guest_name', '')}**")
     if st.button("🚪 Sair", use_container_width=True):
         _dialog_confirmar_logout()
     st.markdown("---")
 
-with st.sidebar:
-    st.subheader("⚙️ Projetos e Categorias")
+if is_admin:
+    with st.sidebar:
+        st.subheader("⚙️ Projetos e Categorias")
 
-    with st.expander("📁 Novo Nome de Projeto"):
-        _manage_options_panel("Projeto", "project", BASE_PROJECT_OPTIONS, get_project_options)
+        with st.expander("📁 Novo Nome de Projeto"):
+            _manage_options_panel("Projeto", "project", BASE_PROJECT_OPTIONS, get_project_options)
 
-    with st.expander("🏷️ Novo Nome de Categoria"):
-        _manage_options_panel("Categoria", "category", BASE_CATEGORY_OPTIONS, get_category_options)
+        with st.expander("🏷️ Novo Nome de Categoria"):
+            _manage_options_panel("Categoria", "category", BASE_CATEGORY_OPTIONS, get_category_options)
 
-with st.sidebar:
-    st.markdown("---")
-    st.subheader("🤖 Recalcular Esforço com IA")
-    st.caption("Reprocessa registros já salvos: reestima horas e reclassifica projeto/categoria.")
+if is_admin:
+    with st.sidebar:
+        st.markdown("---")
+        st.subheader("🤖 Recalcular Esforço com IA")
+        st.caption("Reprocessa registros já salvos: reestima horas e reclassifica projeto/categoria.")
 
-    if not N8N_AI_ESTIMATE_WEBHOOK_URL:
-        st.caption("Configure `N8N_AI_ESTIMATE_WEBHOOK_URL` nos Secrets para habilitar.")
-    else:
-        # O PORQUE: a aba Dashboard & Relatórios já guarda o período aplicado
-        # em st.session_state.dashboard_start_date/end_date -- por padrão
-        # reaproveitamos esse período (opção mais comum: "recalcula o que eu
-        # já estou vendo"), mas sem obrigar -- desmarcando a caixa, aparece um
-        # date_input próprio aqui na barra lateral pra qualquer outra data,
-        # independente do que estiver filtrado no Dashboard no momento.
-        dash_start = st.session_state.get("dashboard_start_date")
-        dash_end = st.session_state.get("dashboard_end_date")
-
-        usar_periodo_dashboard = st.checkbox(
-            "Usar o período já aplicado no Dashboard",
-            value=True,
-            key="ia_recalc_usar_dashboard",
-        )
-
-        if usar_periodo_dashboard:
-            if dash_start and dash_end:
-                st.caption(f"Período: {dash_start.strftime('%d/%m/%Y')} a {dash_end.strftime('%d/%m/%Y')}")
-                recalc_start, recalc_end = dash_start, dash_end
-            else:
-                st.caption("Nenhum período aplicado ainda na aba Dashboard & Relatórios.")
-                recalc_start, recalc_end = None, None
+        if not N8N_AI_ESTIMATE_WEBHOOK_URL:
+            st.caption("Configure `N8N_AI_ESTIMATE_WEBHOOK_URL` nos Secrets para habilitar.")
         else:
-            c_recalc1, c_recalc2 = st.columns(2)
-            with c_recalc1:
-                recalc_start = st.date_input(
-                    "De", value=dash_start or datetime.today().date(), format="DD/MM/YYYY", key="ia_recalc_start"
-                )
-            with c_recalc2:
-                recalc_end = st.date_input(
-                    "Até", value=dash_end or datetime.today().date(), format="DD/MM/YYYY", key="ia_recalc_end"
-                )
+            # O PORQUE: a aba Dashboard & Relatórios já guarda o período aplicado
+            # em st.session_state.dashboard_start_date/end_date -- por padrão
+            # reaproveitamos esse período (opção mais comum: "recalcula o que eu
+            # já estou vendo"), mas sem obrigar -- desmarcando a caixa, aparece um
+            # date_input próprio aqui na barra lateral pra qualquer outra data,
+            # independente do que estiver filtrado no Dashboard no momento.
+            dash_start = st.session_state.get("dashboard_start_date")
+            dash_end = st.session_state.get("dashboard_end_date")
 
-        btn_recalcular_ia = st.button(
-            "🤖 Recalcular com IA",
-            use_container_width=True,
-            key="btn_recalcular_ia",
-            disabled=(recalc_start is None or recalc_end is None),
-            help="Abre uma confirmação antes de aplicar -- nada muda sem você confirmar.",
-        )
-        if btn_recalcular_ia:
-            if recalc_start > recalc_end:
-                st.error("A data inicial não pode ser depois da data final.")
-            else:
-                _dialog_confirmar_recalculo_ia(recalc_start, recalc_end)
+            usar_periodo_dashboard = st.checkbox(
+                "Usar o período já aplicado no Dashboard",
+                value=True,
+                key="ia_recalc_usar_dashboard",
+            )
 
-        # O PORQUE: o resultado só existe em session_state por UM rerun (o que
-        # acontece logo depois do st.rerun() dentro do diálogo) -- .pop() já
-        # remove na hora de ler, então a mensagem aparece uma vez e não fica
-        # "grudada" reaparecendo em reruns futuros não relacionados.
-        resultado_recalculo = st.session_state.pop("_recalculo_ia_resultado", None)
-        if resultado_recalculo:
-            if resultado_recalculo["tipo"] == "aviso":
-                st.warning(resultado_recalculo["mensagem"])
+            if usar_periodo_dashboard:
+                if dash_start and dash_end:
+                    st.caption(f"Período: {dash_start.strftime('%d/%m/%Y')} a {dash_end.strftime('%d/%m/%Y')}")
+                    recalc_start, recalc_end = dash_start, dash_end
+                else:
+                    st.caption("Nenhum período aplicado ainda na aba Dashboard & Relatórios.")
+                    recalc_start, recalc_end = None, None
             else:
-                msg = f"✅ {resultado_recalculo['qtd']} registro(s) recalculado(s)."
-                novos_p = resultado_recalculo["novos_projetos"]
-                novas_c = resultado_recalculo["novas_categorias"]
-                if novos_p or novas_c:
-                    partes = []
-                    if novos_p:
-                        partes.append(f"projeto(s) {', '.join(novos_p)}")
-                    if novas_c:
-                        partes.append(f"categoria(s) {', '.join(novas_c)}")
-                    msg += f" Adicionado(s) automaticamente: {' e '.join(partes)}."
-                st.success(msg)
+                c_recalc1, c_recalc2 = st.columns(2)
+                with c_recalc1:
+                    recalc_start = st.date_input(
+                        "De", value=dash_start or datetime.today().date(), format="DD/MM/YYYY", key="ia_recalc_start"
+                    )
+                with c_recalc2:
+                    recalc_end = st.date_input(
+                        "Até", value=dash_end or datetime.today().date(), format="DD/MM/YYYY", key="ia_recalc_end"
+                    )
+
+            btn_recalcular_ia = st.button(
+                "🤖 Recalcular com IA",
+                use_container_width=True,
+                key="btn_recalcular_ia",
+                disabled=(recalc_start is None or recalc_end is None),
+                help="Abre uma confirmação antes de aplicar -- nada muda sem você confirmar.",
+            )
+            if btn_recalcular_ia:
+                if recalc_start > recalc_end:
+                    st.error("A data inicial não pode ser depois da data final.")
+                else:
+                    _dialog_confirmar_recalculo_ia(recalc_start, recalc_end)
+
+            # O PORQUE: o resultado só existe em session_state por UM rerun (o que
+            # acontece logo depois do st.rerun() dentro do diálogo) -- .pop() já
+            # remove na hora de ler, então a mensagem aparece uma vez e não fica
+            # "grudada" reaparecendo em reruns futuros não relacionados.
+            resultado_recalculo = st.session_state.pop("_recalculo_ia_resultado", None)
+            if resultado_recalculo:
+                if resultado_recalculo["tipo"] == "aviso":
+                    st.warning(resultado_recalculo["mensagem"])
+                else:
+                    msg = f"✅ {resultado_recalculo['qtd']} registro(s) recalculado(s)."
+                    novos_p = resultado_recalculo["novos_projetos"]
+                    novas_c = resultado_recalculo["novas_categorias"]
+                    if novos_p or novas_c:
+                        partes = []
+                        if novos_p:
+                            partes.append(f"projeto(s) {', '.join(novos_p)}")
+                        if novas_c:
+                            partes.append(f"categoria(s) {', '.join(novas_c)}")
+                        msg += f" Adicionado(s) automaticamente: {' e '.join(partes)}."
+                    st.success(msg)
+
+if is_admin:
+    with st.sidebar:
+        st.markdown("---")
+        st.session_state.setdefault("mostrar_admin_solicitacoes", False)
+        if st.button("🔐 Solicitações de Acesso", use_container_width=True):
+            st.session_state.mostrar_admin_solicitacoes = not st.session_state.mostrar_admin_solicitacoes
+        if st.session_state.mostrar_admin_solicitacoes:
+            qtd_pendentes = len(repo.list_access_requests().query("status == 'pending'")) if not repo.list_access_requests().empty else 0
+            if qtd_pendentes:
+                st.caption(f"🔔 {qtd_pendentes} pendente(s)")
 
 st.title("📊 Task Tracker")
 
-tab_manage, tab_daily, tab_dashboard, tab_sync = st.tabs(["Registro de Atividades", "Daily Scrum", "Dashboard & Relatórios", "Sincronização de Arquivo"])
+if is_admin and st.session_state.get("mostrar_admin_solicitacoes"):
+    render_admin_solicitacoes()
+    st.stop()
+
+if is_admin:
+    tab_manage, tab_daily, tab_dashboard, tab_sync = st.tabs(
+        ["Registro de Atividades", "Daily Scrum", "Dashboard & Relatórios", "Sincronização de Arquivo"]
+    )
+else:
+    # O PORQUE: convidado só vê visualização -- registro (somente leitura) e
+    # dashboard. Daily Scrum e Sincronização são ferramentas de trabalho do
+    # dono da conta, sem sentido (e sem permissão) para quem só está
+    # consultando.
+    tab_manage, tab_dashboard = st.tabs(["Registro de Atividades", "Dashboard & Relatórios"])
+    tab_daily = None
+    tab_sync = None
 
 # ==========================================
 # TAB 1: REGISTRO DE ATIVIDADES (GRID & CRUD)
 # ==========================================
 with tab_manage:
+    # O PORQUE: convidado é só-leitura -- mesmo que por algum motivo o
+    # session_state tenha ficado em 'add'/'edit' de uma sessão anterior
+    # (não deveria, já que os botões que levam a esses estados ficam
+    # escondidos abaixo), força de volta pra 'grid' como camada extra de
+    # proteção.
+    if not is_admin and st.session_state.view_state != 'grid':
+        st.session_state.view_state = 'grid'
+
     # O PORQUE: os modais são disparados aqui, no topo da aba, mas a
     # tela de fundo (listagem ou formulário) continua sendo renderizada
     # normalmente logo abaixo — é assim que o modal "flutua" sobre o
@@ -1645,11 +1858,12 @@ with tab_manage:
         with col_header:
             st.header("Suas Atividades")
         with col_add:
-            st.write("")
-            if st.button("➕ Novo Registro", use_container_width=True, type="primary"):
-                st.session_state.view_state = 'add'
-                reset_states(full_reset=False)
-                st.rerun()
+            if is_admin:
+                st.write("")
+                if st.button("➕ Novo Registro", use_container_width=True, type="primary"):
+                    st.session_state.view_state = 'add'
+                    reset_states(full_reset=False)
+                    st.rerun()
 
         # O PORQUE: antes, esta tela trazia o histórico INTEIRO do usuário a
         # cada abertura (get_all_logs_as_dataframe sem filtro nenhum) -- caro
@@ -1772,10 +1986,16 @@ with tab_manage:
                 for col, header in zip(grid_cols, headers):
                     if header in SORTABLE_COLUMNS:
                         col_key = SORTABLE_COLUMNS[header]
-                        # O PORQUE: a seta indica visualmente qual coluna está
-                        # ordenando a tabela no momento e em qual direção.
+                        # O PORQUE: seta simples (▲/▼, caractere de texto puro)
+                        # em vez de emoji colorido (🔼/🔽) -- o emoji, além de
+                        # renderizar grande/colorido dependendo da fonte do
+                        # sistema, podia até quebrar linha dentro do botão em
+                        # colunas estreitas, fazendo a seta cair pra baixo do
+                        # texto do cabeçalho. ▲/▼ é pequeno, mono, e fica
+                        # sempre na mesma linha, à direita do título -- o
+                        # mesmo padrão usado em qualquer tabela de banco.
                         if st.session_state.sort_column == col_key:
-                            arrow = " 🔼" if st.session_state.sort_ascending else " 🔽"
+                            arrow = " ▲" if st.session_state.sort_ascending else " ▼"
                         else:
                             arrow = ""
                         if col.button(f"{header}{arrow}", key=f"sort_btn_{col_key}", use_container_width=True):
@@ -1813,17 +2033,20 @@ with tab_manage:
                     cols[5].write(str(row["effort_hours"]))
 
                     with cols[6]:
-                        btn_col1, btn_col2 = st.columns(2)
-                        with btn_col1:
-                            if st.button("✏️", key=f"edit_{row['id']}", help="Editar"):
-                                st.session_state.target_id = row['id']
-                                st.session_state.view_state = 'edit'
-                                st.rerun()
-                        with btn_col2:
-                            if st.button("🗑️", key=f"del_{row['id']}", help="Excluir"):
-                                st.session_state.target_id = row['id']
-                                st.session_state.confirm_state = 'delete'
-                                st.rerun()
+                        if is_admin:
+                            btn_col1, btn_col2 = st.columns(2)
+                            with btn_col1:
+                                if st.button("✏️", key=f"edit_{row['id']}", help="Editar"):
+                                    st.session_state.target_id = row['id']
+                                    st.session_state.view_state = 'edit'
+                                    st.rerun()
+                            with btn_col2:
+                                if st.button("🗑️", key=f"del_{row['id']}", help="Excluir"):
+                                    st.session_state.target_id = row['id']
+                                    st.session_state.confirm_state = 'delete'
+                                    st.rerun()
+                        else:
+                            st.write("")
                 st.markdown("---")
 
     if st.session_state.view_state == 'add':
@@ -2006,308 +2229,309 @@ with tab_manage:
 # ==========================================
 # TAB 2: DAILY SCRUM
 # ==========================================
-with tab_daily:
-    st.header("Resumo para a Daily")
-    st.caption(
-        "Gera um resumo do que você fez ontem e do que vai fazer hoje, "
-        "pronto para consultar durante a Daily."
-    )
-
-    default_ontem = datetime.today().date() - timedelta(days=1)
-    default_hoje = datetime.today().date()
-
-    # O PORQUE: mesmo padrão do filtro de período do Dashboard -- as duas
-    # datas ficam dentro de um st.form, então trocar "Ontem" ou "Hoje" não
-    # dispara nada sozinho. Só depois de clicar em "Aplicar Período" é que o
-    # valor escolhido passa a valer para as sugestões e para o relatório.
-    with st.form("daily_period_form"):
-        st.markdown("### Escolha o Período")
-        col_d1, col_d2 = st.columns(2)
-        with col_d1:
-            d_ontem_input = st.date_input("Data Anterior (Ontem)", value=default_ontem, format="DD/MM/YYYY", key="daily_d_ontem")
-        with col_d2:
-            d_hoje_input = st.date_input("Data Atual (Hoje)", value=default_hoje, format="DD/MM/YYYY", key="daily_d_hoje")
-        apply_daily_period = st.form_submit_button("Aplicar Período", type="primary")
-
-    if apply_daily_period:
-        st.session_state.daily_period_ontem = d_ontem_input
-        st.session_state.daily_period_hoje = d_hoje_input
-
-    if "daily_period_ontem" not in st.session_state:
-        st.session_state.daily_period_ontem = default_ontem
-    if "daily_period_hoje" not in st.session_state:
-        st.session_state.daily_period_hoje = default_hoje
-
-    d_ontem = st.session_state.daily_period_ontem
-    d_hoje = st.session_state.daily_period_hoje
-
-    st.caption(f"Período aplicado: Ontem = {d_ontem.strftime('%d/%m/%Y')} • Hoje = {d_hoje.strftime('%d/%m/%Y')}")
-
-    # O PORQUE: Impedimentos/Dúvidas passam a ter uma sugestão automática,
-    # montada a partir dos registros do período acima que estiverem marcados
-    # com is_impedimento/is_duvida (via checkbox manual no formulário ou
-    # inferência automática na importação de arquivo). O botão é separado do
-    # "Processar Relatório" de propósito: assim você pode ajustar as datas,
-    # puxar a sugestão, editar à mão o que quiser, e só então gerar o resumo
-    # final -- sem perder o que já tinha digitado a cada rerun da tela.
-    _daily_txt_editing_lock = st.session_state.get("daily_txt_editing", False)
-    if _daily_txt_editing_lock:
-        st.warning("✏️ Finalize (salve) a edição do texto corrido abaixo para liberar os outros botões desta aba.")
-
-    def _merge_daily_suggestion(current_text: str, suggestion_text: str, empty_placeholder: str) -> str:
-        # O PORQUE: antes, "Atualizar sugestões da base de dados" SOBRESCREVIA
-        # por completo o que o usuário já tinha digitado à mão em
-        # Impedimentos/Dúvidas. Agora, cada linha já digitada manualmente é
-        # preservada, e só as linhas da sugestão automática que ainda não
-        # estão lá são adicionadas (sem duplicar). O placeholder padrão
-        # ("Nenhum."/"Nenhuma.") não conta como conteúdo real do usuário.
-        current_lines = [ln.strip() for ln in (current_text or "").strip().splitlines() if ln.strip()]
-        current_lines = [ln for ln in current_lines if ln.lower() != empty_placeholder.lower()]
-
-        suggestion_lines = [ln.strip() for ln in (suggestion_text or "").strip().splitlines() if ln.strip()]
-        suggestion_lines = [ln for ln in suggestion_lines if ln.lower() != empty_placeholder.lower()]
-
-        combined = list(current_lines)
-        for ln in suggestion_lines:
-            if ln not in combined:
-                combined.append(ln)
-
-        return "\n".join(combined) if combined else empty_placeholder
-
-    if st.button("🔄 Atualizar sugestões da base de dados", disabled=_daily_txt_editing_lock):
-        df_all_suggestion = repo.get_all_logs_as_dataframe(_current_user())
-        new_imp_suggestion = build_daily_suggestion(df_all_suggestion, d_ontem, d_hoje, "is_impedimento")
-        new_duv_suggestion = build_daily_suggestion(df_all_suggestion, d_ontem, d_hoje, "is_duvida")
-        st.session_state["impedimentos_input"] = _merge_daily_suggestion(
-            st.session_state.get("impedimentos_input", ""), new_imp_suggestion, "Nenhum."
+if is_admin:
+    with tab_daily:
+        st.header("Resumo para a Daily")
+        st.caption(
+            "Gera um resumo do que você fez ontem e do que vai fazer hoje, "
+            "pronto para consultar durante a Daily."
         )
-        st.session_state["duvidas_input"] = _merge_daily_suggestion(
-            st.session_state.get("duvidas_input", ""), new_duv_suggestion, "Nenhuma."
+
+        default_ontem = datetime.today().date() - timedelta(days=1)
+        default_hoje = datetime.today().date()
+
+        # O PORQUE: mesmo padrão do filtro de período do Dashboard -- as duas
+        # datas ficam dentro de um st.form, então trocar "Ontem" ou "Hoje" não
+        # dispara nada sozinho. Só depois de clicar em "Aplicar Período" é que o
+        # valor escolhido passa a valer para as sugestões e para o relatório.
+        with st.form("daily_period_form"):
+            st.markdown("### Escolha o Período")
+            col_d1, col_d2 = st.columns(2)
+            with col_d1:
+                d_ontem_input = st.date_input("Data Anterior (Ontem)", value=default_ontem, format="DD/MM/YYYY", key="daily_d_ontem")
+            with col_d2:
+                d_hoje_input = st.date_input("Data Atual (Hoje)", value=default_hoje, format="DD/MM/YYYY", key="daily_d_hoje")
+            apply_daily_period = st.form_submit_button("Aplicar Período", type="primary")
+
+        if apply_daily_period:
+            st.session_state.daily_period_ontem = d_ontem_input
+            st.session_state.daily_period_hoje = d_hoje_input
+
+        if "daily_period_ontem" not in st.session_state:
+            st.session_state.daily_period_ontem = default_ontem
+        if "daily_period_hoje" not in st.session_state:
+            st.session_state.daily_period_hoje = default_hoje
+
+        d_ontem = st.session_state.daily_period_ontem
+        d_hoje = st.session_state.daily_period_hoje
+
+        st.caption(f"Período aplicado: Ontem = {d_ontem.strftime('%d/%m/%Y')} • Hoje = {d_hoje.strftime('%d/%m/%Y')}")
+
+        # O PORQUE: Impedimentos/Dúvidas passam a ter uma sugestão automática,
+        # montada a partir dos registros do período acima que estiverem marcados
+        # com is_impedimento/is_duvida (via checkbox manual no formulário ou
+        # inferência automática na importação de arquivo). O botão é separado do
+        # "Processar Relatório" de propósito: assim você pode ajustar as datas,
+        # puxar a sugestão, editar à mão o que quiser, e só então gerar o resumo
+        # final -- sem perder o que já tinha digitado a cada rerun da tela.
+        _daily_txt_editing_lock = st.session_state.get("daily_txt_editing", False)
+        if _daily_txt_editing_lock:
+            st.warning("✏️ Finalize (salve) a edição do texto corrido abaixo para liberar os outros botões desta aba.")
+
+        def _merge_daily_suggestion(current_text: str, suggestion_text: str, empty_placeholder: str) -> str:
+            # O PORQUE: antes, "Atualizar sugestões da base de dados" SOBRESCREVIA
+            # por completo o que o usuário já tinha digitado à mão em
+            # Impedimentos/Dúvidas. Agora, cada linha já digitada manualmente é
+            # preservada, e só as linhas da sugestão automática que ainda não
+            # estão lá são adicionadas (sem duplicar). O placeholder padrão
+            # ("Nenhum."/"Nenhuma.") não conta como conteúdo real do usuário.
+            current_lines = [ln.strip() for ln in (current_text or "").strip().splitlines() if ln.strip()]
+            current_lines = [ln for ln in current_lines if ln.lower() != empty_placeholder.lower()]
+
+            suggestion_lines = [ln.strip() for ln in (suggestion_text or "").strip().splitlines() if ln.strip()]
+            suggestion_lines = [ln for ln in suggestion_lines if ln.lower() != empty_placeholder.lower()]
+
+            combined = list(current_lines)
+            for ln in suggestion_lines:
+                if ln not in combined:
+                    combined.append(ln)
+
+            return "\n".join(combined) if combined else empty_placeholder
+
+        if st.button("🔄 Atualizar sugestões da base de dados", disabled=_daily_txt_editing_lock):
+            df_all_suggestion = repo.get_all_logs_as_dataframe(_current_user())
+            new_imp_suggestion = build_daily_suggestion(df_all_suggestion, d_ontem, d_hoje, "is_impedimento")
+            new_duv_suggestion = build_daily_suggestion(df_all_suggestion, d_ontem, d_hoje, "is_duvida")
+            st.session_state["impedimentos_input"] = _merge_daily_suggestion(
+                st.session_state.get("impedimentos_input", ""), new_imp_suggestion, "Nenhum."
+            )
+            st.session_state["duvidas_input"] = _merge_daily_suggestion(
+                st.session_state.get("duvidas_input", ""), new_duv_suggestion, "Nenhuma."
+            )
+            st.rerun()
+
+        if "impedimentos_input" not in st.session_state:
+            st.session_state["impedimentos_input"] = "Nenhum."
+        if "duvidas_input" not in st.session_state:
+            st.session_state["duvidas_input"] = "Nenhuma."
+
+        impedimentos = st.text_area(
+            "Impedimentos", key="impedimentos_input",
+            help="Puxado automaticamente dos registros marcados como 🚧 Impedimento no período acima. Edite livremente.",
         )
-        st.rerun()
+        duvidas = st.text_area(
+            "Dúvidas", key="duvidas_input",
+            help="Puxado automaticamente dos registros marcados como ❓ Dúvida no período acima. Edite livremente.",
+        )
 
-    if "impedimentos_input" not in st.session_state:
-        st.session_state["impedimentos_input"] = "Nenhum."
-    if "duvidas_input" not in st.session_state:
-        st.session_state["duvidas_input"] = "Nenhuma."
+        def _format_bullets(text: str) -> str:
+            # O PORQUE: antes, só a 1ª linha de Impedimentos/Dúvidas ganhava o
+            # marcador "- " (era um único f"- {texto}" com o texto inteiro,
+            # inclusive multi-linha, embutido depois do marcador). Se o usuário
+            # digitasse mais de um item (uma por linha), as linhas seguintes
+            # ficavam sem marcador e "coladas" ao final -- dando a impressão de
+            # que o conteúdo tinha sumido no texto corrido, mesmo estando lá.
+            # Esta função garante que TODA linha não vazia vire seu próprio item.
+            lines = [ln.strip() for ln in (text or "").strip().splitlines() if ln.strip()]
+            if not lines:
+                return "- Nenhum registro informado."
+            return "\n".join(f"- {ln[1:].strip() if ln.startswith('-') else ln}" for ln in lines)
 
-    impedimentos = st.text_area(
-        "Impedimentos", key="impedimentos_input",
-        help="Puxado automaticamente dos registros marcados como 🚧 Impedimento no período acima. Edite livremente.",
-    )
-    duvidas = st.text_area(
-        "Dúvidas", key="duvidas_input",
-        help="Puxado automaticamente dos registros marcados como ❓ Dúvida no período acima. Edite livremente.",
-    )
+        gen_daily = st.button("Processar Relatório", type="primary", disabled=_daily_txt_editing_lock)
 
-    def _format_bullets(text: str) -> str:
-        # O PORQUE: antes, só a 1ª linha de Impedimentos/Dúvidas ganhava o
-        # marcador "- " (era um único f"- {texto}" com o texto inteiro,
-        # inclusive multi-linha, embutido depois do marcador). Se o usuário
-        # digitasse mais de um item (uma por linha), as linhas seguintes
-        # ficavam sem marcador e "coladas" ao final -- dando a impressão de
-        # que o conteúdo tinha sumido no texto corrido, mesmo estando lá.
-        # Esta função garante que TODA linha não vazia vire seu próprio item.
-        lines = [ln.strip() for ln in (text or "").strip().splitlines() if ln.strip()]
-        if not lines:
-            return "- Nenhum registro informado."
-        return "\n".join(f"- {ln[1:].strip() if ln.startswith('-') else ln}" for ln in lines)
-
-    gen_daily = st.button("Processar Relatório", type="primary", disabled=_daily_txt_editing_lock)
-
-    if gen_daily:
-        df_all_daily = repo.get_all_logs_as_dataframe(_current_user())
-        if not df_all_daily.empty:
-            df_all_daily["log_date_dt"] = pd.to_datetime(df_all_daily["log_date"]).dt.date
-            df_ontem = df_all_daily[df_all_daily["log_date_dt"] == d_ontem]
-            df_hoje = df_all_daily[df_all_daily["log_date_dt"] == d_hoje]
-        else:
-            df_ontem = pd.DataFrame(columns=["project", "description", "effort_hours"])
-            df_hoje = pd.DataFrame(columns=["project", "description", "effort_hours"])
-
-        # Versão em texto puro, usada tanto no download quanto na cópia rápida.
-        report_txt = f"=== DAILY SCRUM ===\nData: {datetime.today().strftime('%d/%m/%Y')}\n\n"
-        report_txt += f"O QUE FIZ ONTEM ({d_ontem.strftime('%d/%m/%Y')}):\n"
-        if df_ontem.empty:
-            report_txt += "- Sem registros mapeados.\n"
-        else:
-            for _, row in df_ontem.iterrows():
-                report_txt += f"- [{row['project']}] {row['description']} ({row['effort_hours']}h)\n"
-        report_txt += f"\nO QUE FAREI HOJE ({d_hoje.strftime('%d/%m/%Y')}):\n"
-        if df_hoje.empty:
-            report_txt += "- Sem registros mapeados.\n"
-        else:
-            for _, row in df_hoje.iterrows():
-                report_txt += f"- [{row['project']}] {row['description']} ({row['effort_hours']}h)\n"
-        report_txt += f"\nIMPEDIMENTOS:\n{_format_bullets(impedimentos)}\n"
-        report_txt += f"\nDÚVIDAS:\n{_format_bullets(duvidas)}\n"
-
-        # O PORQUE: guardamos em session_state para o resumo não sumir da tela
-        # assim que o usuário interage com o botão de download (o Streamlit
-        # reexecuta o script nesse clique, e "gen_daily" voltaria a False já
-        # que o formulário não foi reenviado).
-        st.session_state.daily_report = {
-            "d_ontem": d_ontem,
-            "d_hoje": d_hoje,
-            "df_ontem": df_ontem,
-            "df_hoje": df_hoje,
-            "impedimentos": impedimentos,
-            "duvidas": duvidas,
-            "report_txt": report_txt,
-        }
-
-        # O PORQUE: um novo relatório processado sai do modo de edição (se
-        # estivesse ativo) e limpa qualquer rascunho/erro pendente de uma
-        # edição anterior, para não misturar edições de um resumo antigo com
-        # o resumo recém-gerado.
-        st.session_state["daily_txt_editing"] = False
-        st.session_state["daily_txt_save_error"] = False
-        st.session_state.pop("daily_txt_draft", None)
-
-    if st.session_state.daily_report:
-        rep = st.session_state.daily_report
-        st.markdown("---")
-        st.subheader("📋 Resumo para a Daily")
-        st.caption(f"Gerado em {datetime.today().strftime('%d/%m/%Y %H:%M')}")
-
-        with st.container(border=True):
-            st.markdown(f"**✅ O que fiz ontem** — {rep['d_ontem'].strftime('%d/%m/%Y')}")
-            if rep["df_ontem"].empty:
-                st.info("Sem registros mapeados.")
+        if gen_daily:
+            df_all_daily = repo.get_all_logs_as_dataframe(_current_user())
+            if not df_all_daily.empty:
+                df_all_daily["log_date_dt"] = pd.to_datetime(df_all_daily["log_date"]).dt.date
+                df_ontem = df_all_daily[df_all_daily["log_date_dt"] == d_ontem]
+                df_hoje = df_all_daily[df_all_daily["log_date_dt"] == d_hoje]
             else:
-                for _, row in rep["df_ontem"].iterrows():
-                    st.markdown(f"- **[{row['project']}]** {row['description']}  `{row['effort_hours']}h`")
+                df_ontem = pd.DataFrame(columns=["project", "description", "effort_hours"])
+                df_hoje = pd.DataFrame(columns=["project", "description", "effort_hours"])
 
-        with st.container(border=True):
-            st.markdown(f"**🎯 O que farei hoje** — {rep['d_hoje'].strftime('%d/%m/%Y')}")
-            if rep["df_hoje"].empty:
-                st.info("Sem registros mapeados.")
+            # Versão em texto puro, usada tanto no download quanto na cópia rápida.
+            report_txt = f"=== DAILY SCRUM ===\nData: {datetime.today().strftime('%d/%m/%Y')}\n\n"
+            report_txt += f"O QUE FIZ ONTEM ({d_ontem.strftime('%d/%m/%Y')}):\n"
+            if df_ontem.empty:
+                report_txt += "- Sem registros mapeados.\n"
             else:
-                for _, row in rep["df_hoje"].iterrows():
-                    st.markdown(f"- **[{row['project']}]** {row['description']}  `{row['effort_hours']}h`")
-
-        col_imp, col_duv = st.columns(2)
-        with col_imp:
-            st.markdown("**🚧 Impedimentos**")
-            imp = rep["impedimentos"].strip()
-            if imp and imp.lower() not in ("nenhum.", "nenhum"):
-                st.warning(imp)
+                for _, row in df_ontem.iterrows():
+                    report_txt += f"- [{row['project']}] {row['description']} ({row['effort_hours']}h)\n"
+            report_txt += f"\nO QUE FAREI HOJE ({d_hoje.strftime('%d/%m/%Y')}):\n"
+            if df_hoje.empty:
+                report_txt += "- Sem registros mapeados.\n"
             else:
-                st.success("Nenhum impedimento.")
-        with col_duv:
-            st.markdown("**❓ Dúvidas**")
-            duv = rep["duvidas"].strip()
-            if duv and duv.lower() not in ("nenhuma.", "nenhuma"):
-                st.warning(duv)
-            else:
-                st.success("Nenhuma dúvida.")
+                for _, row in df_hoje.iterrows():
+                    report_txt += f"- [{row['project']}] {row['description']} ({row['effort_hours']}h)\n"
+            report_txt += f"\nIMPEDIMENTOS:\n{_format_bullets(impedimentos)}\n"
+            report_txt += f"\nDÚVIDAS:\n{_format_bullets(duvidas)}\n"
 
-        with st.expander("📄 Ver texto corrido (para copiar e colar)", expanded=True):
-            # O PORQUE: o texto corrido é obrigatório (não pode ficar em
-            # branco) e por padrão fica só para leitura -- edição só é
-            # possível clicando em "Editar", e só sai do modo de edição
-            # salvando (não existe "descartar", já que o campo é
-            # obrigatório e não teria para onde "voltar" em branco).
-            #
-            # As funções de callback (on_click) são a forma correta, segundo
-            # a própria documentação do Streamlit, de alterar o
-            # st.session_state de uma key ligada a um widget: o callback roda
-            # ANTES do script reexecutar do zero, ou seja, antes do widget
-            # ser instanciado novamente -- diferente de atribuir direto
-            # st.session_state[key] = valor no meio do script DEPOIS que o
-            # widget daquela key já foi desenhado no mesmo rerun (isso é o
-            # que causava o StreamlitAPIException reportado).
-            if "daily_txt_editing" not in st.session_state:
-                st.session_state["daily_txt_editing"] = False
+            # O PORQUE: guardamos em session_state para o resumo não sumir da tela
+            # assim que o usuário interage com o botão de download (o Streamlit
+            # reexecuta o script nesse clique, e "gen_daily" voltaria a False já
+            # que o formulário não foi reenviado).
+            st.session_state.daily_report = {
+                "d_ontem": d_ontem,
+                "d_hoje": d_hoje,
+                "df_ontem": df_ontem,
+                "df_hoje": df_hoje,
+                "impedimentos": impedimentos,
+                "duvidas": duvidas,
+                "report_txt": report_txt,
+            }
 
-            def _start_editing_daily_txt():
-                st.session_state["daily_txt_draft"] = rep["report_txt"]
-                st.session_state["daily_txt_editing"] = True
-                st.session_state["daily_txt_save_error"] = False
+            # O PORQUE: um novo relatório processado sai do modo de edição (se
+            # estivesse ativo) e limpa qualquer rascunho/erro pendente de uma
+            # edição anterior, para não misturar edições de um resumo antigo com
+            # o resumo recém-gerado.
+            st.session_state["daily_txt_editing"] = False
+            st.session_state["daily_txt_save_error"] = False
+            st.session_state.pop("daily_txt_draft", None)
 
-            def _save_daily_txt():
-                new_text = st.session_state.get("daily_txt_draft", "").strip()
-                if not new_text:
-                    # O PORQUE: campo obrigatório -- não salva e mantém o
-                    # modo de edição aberto, mostrando o erro no próximo rerun.
-                    st.session_state["daily_txt_save_error"] = True
+        if st.session_state.daily_report:
+            rep = st.session_state.daily_report
+            st.markdown("---")
+            st.subheader("📋 Resumo para a Daily")
+            st.caption(f"Gerado em {datetime.today().strftime('%d/%m/%Y %H:%M')}")
+
+            with st.container(border=True):
+                st.markdown(f"**✅ O que fiz ontem** — {rep['d_ontem'].strftime('%d/%m/%Y')}")
+                if rep["df_ontem"].empty:
+                    st.info("Sem registros mapeados.")
                 else:
-                    # O PORQUE: rep é o mesmo dict guardado em
-                    # st.session_state.daily_report, então esta atribuição já
-                    # atualiza o relatório oficial usado pelo download abaixo.
-                    rep["report_txt"] = st.session_state["daily_txt_draft"]
+                    for _, row in rep["df_ontem"].iterrows():
+                        st.markdown(f"- **[{row['project']}]** {row['description']}  `{row['effort_hours']}h`")
+
+            with st.container(border=True):
+                st.markdown(f"**🎯 O que farei hoje** — {rep['d_hoje'].strftime('%d/%m/%Y')}")
+                if rep["df_hoje"].empty:
+                    st.info("Sem registros mapeados.")
+                else:
+                    for _, row in rep["df_hoje"].iterrows():
+                        st.markdown(f"- **[{row['project']}]** {row['description']}  `{row['effort_hours']}h`")
+
+            col_imp, col_duv = st.columns(2)
+            with col_imp:
+                st.markdown("**🚧 Impedimentos**")
+                imp = rep["impedimentos"].strip()
+                if imp and imp.lower() not in ("nenhum.", "nenhum"):
+                    st.warning(imp)
+                else:
+                    st.success("Nenhum impedimento.")
+            with col_duv:
+                st.markdown("**❓ Dúvidas**")
+                duv = rep["duvidas"].strip()
+                if duv and duv.lower() not in ("nenhuma.", "nenhuma"):
+                    st.warning(duv)
+                else:
+                    st.success("Nenhuma dúvida.")
+
+            with st.expander("📄 Ver texto corrido (para copiar e colar)", expanded=True):
+                # O PORQUE: o texto corrido é obrigatório (não pode ficar em
+                # branco) e por padrão fica só para leitura -- edição só é
+                # possível clicando em "Editar", e só sai do modo de edição
+                # salvando (não existe "descartar", já que o campo é
+                # obrigatório e não teria para onde "voltar" em branco).
+                #
+                # As funções de callback (on_click) são a forma correta, segundo
+                # a própria documentação do Streamlit, de alterar o
+                # st.session_state de uma key ligada a um widget: o callback roda
+                # ANTES do script reexecutar do zero, ou seja, antes do widget
+                # ser instanciado novamente -- diferente de atribuir direto
+                # st.session_state[key] = valor no meio do script DEPOIS que o
+                # widget daquela key já foi desenhado no mesmo rerun (isso é o
+                # que causava o StreamlitAPIException reportado).
+                if "daily_txt_editing" not in st.session_state:
+                    st.session_state["daily_txt_editing"] = False
+
+                def _start_editing_daily_txt():
+                    st.session_state["daily_txt_draft"] = rep["report_txt"]
+                    st.session_state["daily_txt_editing"] = True
+                    st.session_state["daily_txt_save_error"] = False
+
+                def _save_daily_txt():
+                    new_text = st.session_state.get("daily_txt_draft", "").strip()
+                    if not new_text:
+                        # O PORQUE: campo obrigatório -- não salva e mantém o
+                        # modo de edição aberto, mostrando o erro no próximo rerun.
+                        st.session_state["daily_txt_save_error"] = True
+                    else:
+                        # O PORQUE: rep é o mesmo dict guardado em
+                        # st.session_state.daily_report, então esta atribuição já
+                        # atualiza o relatório oficial usado pelo download abaixo.
+                        rep["report_txt"] = st.session_state["daily_txt_draft"]
+                        st.session_state["daily_txt_editing"] = False
+                        st.session_state["daily_txt_save_error"] = False
+
+                def _cancel_editing_daily_txt():
+                    # O PORQUE: só sai do modo de edição e descarta o rascunho --
+                    # como o campo é obrigatório, não há risco de "cancelar para
+                    # um estado em branco": rep["report_txt"] (última versão
+                    # salva) continua intacto e volta a ser exibido.
                     st.session_state["daily_txt_editing"] = False
                     st.session_state["daily_txt_save_error"] = False
 
-            def _cancel_editing_daily_txt():
-                # O PORQUE: só sai do modo de edição e descarta o rascunho --
-                # como o campo é obrigatório, não há risco de "cancelar para
-                # um estado em branco": rep["report_txt"] (última versão
-                # salva) continua intacto e volta a ser exibido.
-                st.session_state["daily_txt_editing"] = False
-                st.session_state["daily_txt_save_error"] = False
+                editing = st.session_state["daily_txt_editing"]
 
-            editing = st.session_state["daily_txt_editing"]
-
-            if not editing:
-                st.text_area(
-                    # O PORQUE: aqui NÃO usamos "key" junto de "value" -- se
-                    # usássemos, o Streamlit só aplicaria "value" na primeira
-                    # vez que essa key aparecesse; nas próximas vezes ele
-                    # ignoraria o novo "value" e manteria travado o que já
-                    # estava salvo em session_state daquela key (era
-                    # exatamente o bug: o texto corrido ficava congelado no
-                    # primeiro "Nenhum."/"Nenhuma." gerado, mesmo depois de
-                    # reprocessar o relatório com dados novos).
-                    "Copia rápida", value=rep["report_txt"], height=300,
-                    label_visibility="collapsed", disabled=True,
-                )
-                st.button(
-                    "✏️ Editar texto", key="btn_edit_daily_txt",
-                    on_click=_start_editing_daily_txt, use_container_width=True,
-                )
-            else:
-                st.text_area(
-                    "Copia rápida (editando)", key="daily_txt_draft", height=300,
-                    label_visibility="collapsed",
-                )
-                if st.session_state.get("daily_txt_save_error"):
-                    st.error("O texto não pode ficar em branco. Escreva algo antes de salvar.")
-                st.caption("✍️ Editando — salve para aplicar a mudança e liberar os outros botões da aba.")
-                col_save, col_cancel = st.columns(2)
-                with col_save:
-                    st.button(
-                        "💾 Salvar alterações", key="btn_save_daily_txt", type="primary",
-                        on_click=_save_daily_txt, use_container_width=True,
+                if not editing:
+                    st.text_area(
+                        # O PORQUE: aqui NÃO usamos "key" junto de "value" -- se
+                        # usássemos, o Streamlit só aplicaria "value" na primeira
+                        # vez que essa key aparecesse; nas próximas vezes ele
+                        # ignoraria o novo "value" e manteria travado o que já
+                        # estava salvo em session_state daquela key (era
+                        # exatamente o bug: o texto corrido ficava congelado no
+                        # primeiro "Nenhum."/"Nenhuma." gerado, mesmo depois de
+                        # reprocessar o relatório com dados novos).
+                        "Copia rápida", value=rep["report_txt"], height=300,
+                        label_visibility="collapsed", disabled=True,
                     )
-                with col_cancel:
                     st.button(
-                        "🚫 Cancelar edição", key="btn_cancel_daily_txt",
-                        on_click=_cancel_editing_daily_txt, use_container_width=True,
+                        "✏️ Editar texto", key="btn_edit_daily_txt",
+                        on_click=_start_editing_daily_txt, use_container_width=True,
                     )
+                else:
+                    st.text_area(
+                        "Copia rápida (editando)", key="daily_txt_draft", height=300,
+                        label_visibility="collapsed",
+                    )
+                    if st.session_state.get("daily_txt_save_error"):
+                        st.error("O texto não pode ficar em branco. Escreva algo antes de salvar.")
+                    st.caption("✍️ Editando — salve para aplicar a mudança e liberar os outros botões da aba.")
+                    col_save, col_cancel = st.columns(2)
+                    with col_save:
+                        st.button(
+                            "💾 Salvar alterações", key="btn_save_daily_txt", type="primary",
+                            on_click=_save_daily_txt, use_container_width=True,
+                        )
+                    with col_cancel:
+                        st.button(
+                            "🚫 Cancelar edição", key="btn_cancel_daily_txt",
+                            on_click=_cancel_editing_daily_txt, use_container_width=True,
+                        )
 
-        # O PORQUE: enquanto o texto corrido estiver em modo de edição, o
-        # download (e os outros botões da aba, travados lá em cima) ficam
-        # bloqueados -- o arquivo baixado nunca diverge do que está na tela
-        # sem uma decisão explícita do usuário (salvar).
-        pending_changes = st.session_state.get("daily_txt_editing", False)
+            # O PORQUE: enquanto o texto corrido estiver em modo de edição, o
+            # download (e os outros botões da aba, travados lá em cima) ficam
+            # bloqueados -- o arquivo baixado nunca diverge do que está na tela
+            # sem uma decisão explícita do usuário (salvar).
+            pending_changes = st.session_state.get("daily_txt_editing", False)
 
-        st.markdown("---")
-        if pending_changes:
-            st.info("⚠️ Salve as alterações no texto corrido acima para liberar o download.")
-        st.download_button(
-            label="⬇️ Baixar Resumo da Daily (.txt)",
-            data=rep["report_txt"].encode("utf-8"),
-            file_name=f"daily_{datetime.today().strftime('%Y%m%d')}.txt",
-            mime="text/plain",
-            use_container_width=True,
-            type="primary",
-            disabled=pending_changes,
-        )
+            st.markdown("---")
+            if pending_changes:
+                st.info("⚠️ Salve as alterações no texto corrido acima para liberar o download.")
+            st.download_button(
+                label="⬇️ Baixar Resumo da Daily (.txt)",
+                data=rep["report_txt"].encode("utf-8"),
+                file_name=f"daily_{datetime.today().strftime('%Y%m%d')}.txt",
+                mime="text/plain",
+                use_container_width=True,
+                type="primary",
+                disabled=pending_changes,
+            )
 
-# ==========================================
-# TAB 3: DASHBOARD, RELATÓRIOS E EXPORTAÇÃO
-# ==========================================
+    # ==========================================
+    # TAB 3: DASHBOARD, RELATÓRIOS E EXPORTAÇÃO
+    # ==========================================
 with tab_dashboard:
     st.header("Seus Números")
     df_logs = repo.get_all_logs_as_dataframe(_current_user())
@@ -2779,159 +3003,160 @@ def dialog_confirmar_cancelamento_sync():
             st.rerun()
 
 
-with tab_sync:
-    if st.session_state.confirm_state == 'cancel_sync':
-        dialog_confirmar_cancelamento_sync()
+if is_admin:
+    with tab_sync:
+        if st.session_state.confirm_state == 'cancel_sync':
+            dialog_confirmar_cancelamento_sync()
 
-    st.header("Sincronizar Arquivo de Histórico")
-    st.info("Envie o arquivo de histórico (.txt ou .csv) para comparar com os registros já salvos. Você poderá escolher, um a um, o que aplicar. No final, vamos pedir que você digite o nome do arquivo enviado para confirmar a operação.")
+        st.header("Sincronizar Arquivo de Histórico")
+        st.info("Envie o arquivo de histórico (.txt ou .csv) para comparar com os registros já salvos. Você poderá escolher, um a um, o que aplicar. No final, vamos pedir que você digite o nome do arquivo enviado para confirmar a operação.")
 
-    # O PORQUE: Upload em memória (UploadedFile) substitui a leitura fixa de
-    # "raw_history.txt" na raiz do projeto. Isso permite sincronizar a partir
-    # de qualquer máquina/pasta, sem depender do arquivo estar no diretório
-    # de execução do Streamlit. Aceita tanto o formato de log em .txt quanto
-    # um .csv já estruturado nas colunas log_date;project;category;description;effort_hours.
-    st.caption(f"Tamanho máximo permitido: {MAX_UPLOAD_SIZE_MB}MB.")
-    uploaded_file = st.file_uploader(
-        "Arquivo de histórico (.txt ou .csv)",
-        type=["txt", "csv"],
-        key="sync_uploader",
-        help=(
-            "Arquivos .txt seguem o formato de log manual (datas + tarefas, uma por linha). "
-            "Arquivos .csv devem ter as colunas log_date;project;category;description;effort_hours "
-            "(separador ';' e decimal ',' -- padrão pt-BR -- ou separador ',' e decimal '.' -- padrão US; "
-            "datas em dd/mm/aaaa ou aaaa-mm-dd)."
-        ),
-    )
-
-    upload_too_large = False
-    if uploaded_file is not None and uploaded_file.size > MAX_UPLOAD_SIZE_BYTES:
-        upload_too_large = True
-        uploaded_size_mb = uploaded_file.size / (1024 * 1024)
-        st.error(
-            f"Arquivo '{uploaded_file.name}' tem {uploaded_size_mb:.1f}MB, "
-            f"acima do limite de {MAX_UPLOAD_SIZE_MB}MB. Envie um arquivo menor."
+        # O PORQUE: Upload em memória (UploadedFile) substitui a leitura fixa de
+        # "raw_history.txt" na raiz do projeto. Isso permite sincronizar a partir
+        # de qualquer máquina/pasta, sem depender do arquivo estar no diretório
+        # de execução do Streamlit. Aceita tanto o formato de log em .txt quanto
+        # um .csv já estruturado nas colunas log_date;project;category;description;effort_hours.
+        st.caption(f"Tamanho máximo permitido: {MAX_UPLOAD_SIZE_MB}MB.")
+        uploaded_file = st.file_uploader(
+            "Arquivo de histórico (.txt ou .csv)",
+            type=["txt", "csv"],
+            key="sync_uploader",
+            help=(
+                "Arquivos .txt seguem o formato de log manual (datas + tarefas, uma por linha). "
+                "Arquivos .csv devem ter as colunas log_date;project;category;description;effort_hours "
+                "(separador ';' e decimal ',' -- padrão pt-BR -- ou separador ',' e decimal '.' -- padrão US; "
+                "datas em dd/mm/aaaa ou aaaa-mm-dd)."
+            ),
         )
 
-    if st.button("Analisar Arquivo Enviado", type="primary", disabled=(uploaded_file is None or upload_too_large)):
-        # O PORQUE: só capturamos os bytes/nome do arquivo aqui (enquanto o
-        # widget uploaded_file ainda existe nesta execução) e delegamos o
-        # processamento pesado (parse + comparação + IA) pro dispatcher --
-        # durante o bloqueio de tela cheia, NENHUM widget é redesenhado
-        # (nem o próprio uploader), então tudo que for necessário precisa
-        # estar dentro do payload, não em variáveis/widgets locais.
-        raw_bytes = uploaded_file.read()
-        file_ext = os.path.splitext(uploaded_file.name)[1].lower()
-        run_blocking_action(
-            "ia_analisar_arquivo",
-            {"raw_bytes": raw_bytes, "file_ext": file_ext, "file_name": uploaded_file.name},
-            processing_message="Comparando com os registros salvos...",
-            success_message="Análise concluída.",
-            failure_message="Não foi possível analisar o arquivo.",
-        )
+        upload_too_large = False
+        if uploaded_file is not None and uploaded_file.size > MAX_UPLOAD_SIZE_BYTES:
+            upload_too_large = True
+            uploaded_size_mb = uploaded_file.size / (1024 * 1024)
+            st.error(
+                f"Arquivo '{uploaded_file.name}' tem {uploaded_size_mb:.1f}MB, "
+                f"acima do limite de {MAX_UPLOAD_SIZE_MB}MB. Envie um arquivo menor."
+            )
 
-    if st.session_state.sync_analyzed:
-        st.markdown("---")
+        if st.button("Analisar Arquivo Enviado", type="primary", disabled=(uploaded_file is None or upload_too_large)):
+            # O PORQUE: só capturamos os bytes/nome do arquivo aqui (enquanto o
+            # widget uploaded_file ainda existe nesta execução) e delegamos o
+            # processamento pesado (parse + comparação + IA) pro dispatcher --
+            # durante o bloqueio de tela cheia, NENHUM widget é redesenhado
+            # (nem o próprio uploader), então tudo que for necessário precisa
+            # estar dentro do payload, não em variáveis/widgets locais.
+            raw_bytes = uploaded_file.read()
+            file_ext = os.path.splitext(uploaded_file.name)[1].lower()
+            run_blocking_action(
+                "ia_analisar_arquivo",
+                {"raw_bytes": raw_bytes, "file_ext": file_ext, "file_name": uploaded_file.name},
+                processing_message="Comparando com os registros salvos...",
+                success_message="Análise concluída.",
+                failure_message="Não foi possível analisar o arquivo.",
+            )
 
-        # O PORQUE: resultado da estimativa por IA (calculado durante o
-        # bloqueio de tela cheia, onde st.warning/st.info não apareceriam
-        # pro usuário) -- exibido aqui, na primeira renderização normal
-        # depois da análise. .pop() garante que só aparece uma vez.
-        analise_ia_info = st.session_state.pop("_analise_arquivo_ia_info", None)
-        if analise_ia_info:
-            if analise_ia_info["ia_aviso"]:
-                st.warning(
-                    f"⚠️ Não foi possível usar a estimativa por IA agora ({analise_ia_info['ia_aviso']}). "
-                    "Os registros abaixo seguem com esforço fixo (1h) e classificação "
-                    "por palavra-chave, como antes -- revise/ajuste manualmente se precisar."
-                )
-            elif analise_ia_info["novos_projetos"] or analise_ia_info["novas_categorias"]:
-                partes = []
-                if analise_ia_info["novos_projetos"]:
-                    partes.append(f"projeto(s) **{', '.join(analise_ia_info['novos_projetos'])}**")
-                if analise_ia_info["novas_categorias"]:
-                    partes.append(f"categoria(s) **{', '.join(analise_ia_info['novas_categorias'])}**")
-                st.info(f"🤖 IA aplicada. Adicionado(s) automaticamente: {' e '.join(partes)}.")
-            elif N8N_AI_ESTIMATE_WEBHOOK_URL:
-                st.info("🤖 Estimativa de esforço e classificação por IA aplicada.")
+        if st.session_state.sync_analyzed:
+            st.markdown("---")
 
-        edited_insert = pd.DataFrame()
-        edited_delete = pd.DataFrame()
+            # O PORQUE: resultado da estimativa por IA (calculado durante o
+            # bloqueio de tela cheia, onde st.warning/st.info não apareceriam
+            # pro usuário) -- exibido aqui, na primeira renderização normal
+            # depois da análise. .pop() garante que só aparece uma vez.
+            analise_ia_info = st.session_state.pop("_analise_arquivo_ia_info", None)
+            if analise_ia_info:
+                if analise_ia_info["ia_aviso"]:
+                    st.warning(
+                        f"⚠️ Não foi possível usar a estimativa por IA agora ({analise_ia_info['ia_aviso']}). "
+                        "Os registros abaixo seguem com esforço fixo (1h) e classificação "
+                        "por palavra-chave, como antes -- revise/ajuste manualmente se precisar."
+                    )
+                elif analise_ia_info["novos_projetos"] or analise_ia_info["novas_categorias"]:
+                    partes = []
+                    if analise_ia_info["novos_projetos"]:
+                        partes.append(f"projeto(s) **{', '.join(analise_ia_info['novos_projetos'])}**")
+                    if analise_ia_info["novas_categorias"]:
+                        partes.append(f"categoria(s) **{', '.join(analise_ia_info['novas_categorias'])}**")
+                    st.info(f"🤖 IA aplicada. Adicionado(s) automaticamente: {' e '.join(partes)}.")
+                elif N8N_AI_ESTIMATE_WEBHOOK_URL:
+                    st.info("🤖 Estimativa de esforço e classificação por IA aplicada.")
 
-        col_ins, col_del = st.columns(2)
+            edited_insert = pd.DataFrame()
+            edited_delete = pd.DataFrame()
 
-        with col_ins:
-            st.subheader("🟢 Novos Registros")
-            if st.session_state.df_to_insert.empty:
-                st.success("Nenhum registro novo encontrado no arquivo.")
-            else:
-                st.write("Desmarque a caixa `_Aplicar` para ignorar o registro. Projeto, Categoria e Horas já vêm editáveis (úteis para corrigir uma sugestão da IA, se houver).")
-                # O PORQUE: st.data_editor permite manipulação booleana direto no DataFrame sem loops complexos.
-                # DateColumn com format="DD/MM/YYYY" exibe a data no padrão brasileiro
-                # mesmo com o valor por baixo continuando em ISO (YYYY-MM-DD).
-                # project/category viraram SelectboxColumn (com opção de digitar um
-                # novo valor não listado) e effort_hours virou editável, porque agora
-                # esses três campos podem vir de uma estimativa por IA que às vezes
-                # precisa de um ajuste manual antes de confirmar.
-                edited_insert = st.data_editor(
-                    st.session_state.df_to_insert,
-                    column_config={
-                        "_Aplicar": st.column_config.CheckboxColumn("Aplicar", default=True),
-                        "log_date": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
-                        "project": st.column_config.SelectboxColumn("Projeto", options=get_project_options()),
-                        "category": st.column_config.SelectboxColumn("Categoria", options=get_category_options()),
-                        "effort_hours": st.column_config.NumberColumn("Horas", min_value=0.0, max_value=24.0, step=0.25),
-                        "is_impedimento": st.column_config.CheckboxColumn("🚧 Impedimento"),
-                        "is_duvida": st.column_config.CheckboxColumn("❓ Dúvida"),
-                    },
-                    disabled=["log_date", "description", "is_impedimento", "is_duvida"],
-                    hide_index=True,
-                    use_container_width=True,
-                    key="editor_insert"
-                )
+            col_ins, col_del = st.columns(2)
 
-        with col_del:
-            st.subheader("🔴 Registros para Remover")
-            if st.session_state.df_to_delete.empty:
-                st.success("Nenhum registro para remover.")
-            else:
-                st.write("Desmarque a caixa `_Aplicar` para impedir a exclusão.")
-                edited_delete = st.data_editor(
-                    st.session_state.df_to_delete,
-                    column_config={
-                        "_Aplicar": st.column_config.CheckboxColumn("Excluir", default=True),
-                        "log_date": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
-                        "is_impedimento": st.column_config.CheckboxColumn("🚧 Impedimento"),
-                        "is_duvida": st.column_config.CheckboxColumn("❓ Dúvida"),
-                    },
-                    disabled=["id", "log_date", "project", "category", "description", "effort_hours", "created_at", "is_impedimento", "is_duvida"],
-                    hide_index=True,
-                    use_container_width=True,
-                    key="editor_delete"
-                )
+            with col_ins:
+                st.subheader("🟢 Novos Registros")
+                if st.session_state.df_to_insert.empty:
+                    st.success("Nenhum registro novo encontrado no arquivo.")
+                else:
+                    st.write("Desmarque a caixa `_Aplicar` para ignorar o registro. Projeto, Categoria e Horas já vêm editáveis (úteis para corrigir uma sugestão da IA, se houver).")
+                    # O PORQUE: st.data_editor permite manipulação booleana direto no DataFrame sem loops complexos.
+                    # DateColumn com format="DD/MM/YYYY" exibe a data no padrão brasileiro
+                    # mesmo com o valor por baixo continuando em ISO (YYYY-MM-DD).
+                    # project/category viraram SelectboxColumn (com opção de digitar um
+                    # novo valor não listado) e effort_hours virou editável, porque agora
+                    # esses três campos podem vir de uma estimativa por IA que às vezes
+                    # precisa de um ajuste manual antes de confirmar.
+                    edited_insert = st.data_editor(
+                        st.session_state.df_to_insert,
+                        column_config={
+                            "_Aplicar": st.column_config.CheckboxColumn("Aplicar", default=True),
+                            "log_date": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
+                            "project": st.column_config.SelectboxColumn("Projeto", options=get_project_options()),
+                            "category": st.column_config.SelectboxColumn("Categoria", options=get_category_options()),
+                            "effort_hours": st.column_config.NumberColumn("Horas", min_value=0.0, max_value=24.0, step=0.25),
+                            "is_impedimento": st.column_config.CheckboxColumn("🚧 Impedimento"),
+                            "is_duvida": st.column_config.CheckboxColumn("❓ Dúvida"),
+                        },
+                        disabled=["log_date", "description", "is_impedimento", "is_duvida"],
+                        hide_index=True,
+                        use_container_width=True,
+                        key="editor_insert"
+                    )
 
-        st.markdown("### Confirmação de Segurança")
-        expected_name = st.session_state.get("sync_file_name", "raw_history.txt")
-        st.warning(f"Para confirmar, digite exatamente `{expected_name}` (o nome do arquivo que você enviou).")
+            with col_del:
+                st.subheader("🔴 Registros para Remover")
+                if st.session_state.df_to_delete.empty:
+                    st.success("Nenhum registro para remover.")
+                else:
+                    st.write("Desmarque a caixa `_Aplicar` para impedir a exclusão.")
+                    edited_delete = st.data_editor(
+                        st.session_state.df_to_delete,
+                        column_config={
+                            "_Aplicar": st.column_config.CheckboxColumn("Excluir", default=True),
+                            "log_date": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
+                            "is_impedimento": st.column_config.CheckboxColumn("🚧 Impedimento"),
+                            "is_duvida": st.column_config.CheckboxColumn("❓ Dúvida"),
+                        },
+                        disabled=["id", "log_date", "project", "category", "description", "effort_hours", "created_at", "is_impedimento", "is_duvida"],
+                        hide_index=True,
+                        use_container_width=True,
+                        key="editor_delete"
+                    )
 
-        confirm_text = st.text_input("Confirmação:")
+            st.markdown("### Confirmação de Segurança")
+            expected_name = st.session_state.get("sync_file_name", "raw_history.txt")
+            st.warning(f"Para confirmar, digite exatamente `{expected_name}` (o nome do arquivo que você enviou).")
 
-        col_sync, col_cancel_sync = st.columns(2)
-        with col_sync:
-            btn_sync = st.button("Sincronizar", type="primary", use_container_width=True)
-        with col_cancel_sync:
-            if st.button("Cancelar", use_container_width=True):
-                st.session_state.confirm_state = 'cancel_sync'
-                st.rerun()
+            confirm_text = st.text_input("Confirmação:")
 
-        if btn_sync:
-            if confirm_text != expected_name:
-                st.error("Nome do arquivo incorreto. Tente novamente.")
-            else:
-                run_blocking_action(
-                    "ia_sincronizar",
-                    {"edited_insert": edited_insert, "edited_delete": edited_delete},
-                    processing_message="Sincronizando registros...",
-                    success_message="Sincronização concluída.",
-                    failure_message="Não foi possível sincronizar.",
-                )
+            col_sync, col_cancel_sync = st.columns(2)
+            with col_sync:
+                btn_sync = st.button("Sincronizar", type="primary", use_container_width=True)
+            with col_cancel_sync:
+                if st.button("Cancelar", use_container_width=True):
+                    st.session_state.confirm_state = 'cancel_sync'
+                    st.rerun()
+
+            if btn_sync:
+                if confirm_text != expected_name:
+                    st.error("Nome do arquivo incorreto. Tente novamente.")
+                else:
+                    run_blocking_action(
+                        "ia_sincronizar",
+                        {"edited_insert": edited_insert, "edited_delete": edited_delete},
+                        processing_message="Sincronizando registros...",
+                        success_message="Sincronização concluída.",
+                        failure_message="Não foi possível sincronizar.",
+                    )

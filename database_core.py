@@ -118,6 +118,27 @@ class LogRepository:
         """
         self.conn.execute(query_options)
         self._ensure_column("custom_options", "username", "TEXT")
+
+        # O PORQUE: tabela nova para o fluxo de "solicitação de acesso de
+        # convidado" -- quem não tem usuário/senha preenche nome, e-mail e
+        # justificativa; o admin aprova/rejeita/exclui pela área
+        # administrativa. access_token só é preenchido quando aprovado (é o
+        # que vira o link de acesso -- ?g=<token> -- que o admin copia e
+        # manda pra pessoa). status controla quem pode entrar: só
+        # 'approved' com token válido consegue.
+        query_access_requests = """
+        CREATE TABLE IF NOT EXISTS access_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL,
+            justification TEXT,
+            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'approved', 'rejected')),
+            access_token TEXT,
+            requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            decided_at TIMESTAMP
+        );
+        """
+        self.conn.execute(query_access_requests)
         self.conn.commit()
 
     def _ensure_column(self, table: str, column: str, column_def: str):
@@ -292,3 +313,89 @@ class LogRepository:
         except Exception:
             columns = WORK_LOGS_COLUMNS
         return pd.DataFrame(rows, columns=columns)
+
+    # ==========================================
+    # SOLICITAÇÕES DE ACESSO DE CONVIDADO
+    # ==========================================
+    ACCESS_REQUESTS_COLUMNS = [
+        "id", "name", "email", "justification", "status", "access_token", "requested_at", "decided_at",
+    ]
+
+    def count_active_access_requests(self) -> int:
+        # O PORQUE: "ativa" = pending OU approved -- é o que conta pro limite
+        # de 5. Uma rejeitada ou excluída libera vaga na hora.
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM access_requests WHERE status IN ('pending', 'approved')"
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def get_active_access_request_by_email(self, email: str):
+        # O PORQUE: usado pra checar duplicidade -- só bloqueia um e-mail
+        # novo se já existir uma solicitação ATIVA (pending/approved) com
+        # esse e-mail. Uma pessoa cuja solicitação foi rejeitada pode
+        # solicitar de novo (ex.: com uma justificativa melhor).
+        row = self.conn.execute(
+            "SELECT id FROM access_requests WHERE email = ? AND status IN ('pending', 'approved')",
+            (email.strip().lower(),),
+        ).fetchone()
+        return row[0] if row else None
+
+    def create_access_request(self, name: str, email: str, justification: str) -> int:
+        cursor = self.conn.execute(
+            "INSERT INTO access_requests (name, email, justification, status) VALUES (?, ?, ?, 'pending')",
+            (name.strip(), email.strip().lower(), justification.strip()),
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def list_access_requests(self) -> pd.DataFrame:
+        cursor = self.conn.execute(
+            "SELECT * FROM access_requests ORDER BY requested_at DESC"
+        )
+        rows = cursor.fetchall()
+        try:
+            columns = [d[0] for d in cursor.description]
+        except Exception:
+            columns = self.ACCESS_REQUESTS_COLUMNS
+        return pd.DataFrame(rows, columns=columns)
+
+    def approve_access_request(self, request_id: int) -> str:
+        # O PORQUE: gera o token só na hora da aprovação (não antes) -- um
+        # pedido pendente não tem nenhum link válido ainda, então não tem
+        # como "vazar" acesso de algo que nunca foi aprovado.
+        import secrets as _secrets
+        token = _secrets.token_urlsafe(24)
+        self.conn.execute(
+            "UPDATE access_requests SET status = 'approved', access_token = ?, decided_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (token, request_id),
+        )
+        self.conn.commit()
+        return token
+
+    def reject_access_request(self, request_id: int):
+        # O PORQUE: também serve para REVOGAR um acesso já aprovado -- muda
+        # o status pra 'rejected', o que invalida o token na hora (ver
+        # get_access_request_by_token, que só aceita status='approved').
+        self.conn.execute(
+            "UPDATE access_requests SET status = 'rejected', access_token = NULL, decided_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (request_id,),
+        )
+        self.conn.commit()
+
+    def delete_access_request(self, request_id: int):
+        self.conn.execute("DELETE FROM access_requests WHERE id = ?", (request_id,))
+        self.conn.commit()
+
+    def get_access_request_by_token(self, token: str):
+        # O PORQUE: checagem ao vivo no banco (não um token autoverificável
+        # tipo o de sessão do admin) -- é isso que permite revogar o acesso
+        # de um convidado instantaneamente (rejeitar/excluir o pedido), sem
+        # depender de expiração por tempo nem de lista de tokens revogados
+        # em memória.
+        row = self.conn.execute(
+            "SELECT id, name, email, status FROM access_requests WHERE access_token = ? AND status = 'approved'",
+            (token,),
+        ).fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "name": row[1], "email": row[2], "status": row[3]}
