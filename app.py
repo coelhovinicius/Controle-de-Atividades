@@ -10,6 +10,7 @@ import os
 import sys
 import hmac
 import base64
+import hashlib
 import bcrypt
 import requests
 import secrets as pysecrets
@@ -91,16 +92,23 @@ if not repo.db_connection.using_turso and (os.environ.get("TURSO_DATABASE_URL") 
 
 # O PORQUE: st.session_state é por sessão de navegador e se perde ao
 # recarregar a página (F5) -- por isso, sozinho, não sustenta "ficar logado
-# até clicar em Sair". O token vai para a URL (?s=...) para sobreviver a um
-# F5, e agora ele mesmo carrega usuário + validade, ASSINADOS com HMAC --
-# ou seja, validar o token não depende de nenhum dicionário na memória do
-# processo. Isso significa que a sessão sobrevive não só a um F5, mas
-# também a um restart do servidor (Ctrl+C + rodar de novo, ou um redeploy
-# no Streamlit Cloud), desde que SESSION_SECRET_KEY esteja configurada nos
-# Secrets (veja abaixo) -- sem isso, cada restart gera uma chave nova
-# sozinho, e a sessão se comporta como antes (só sobrevive a F5, não a
-# restart).
-SESSION_TTL_HOURS = 12
+# até clicar em Sair". O token vai para um COOKIE (gravado no navegador via
+# JavaScript no momento do login) para sobreviver a um F5, e ele mesmo
+# carrega usuário + validade, ASSINADOS com HMAC -- ou seja, validar o
+# token não depende de nenhum dicionário na memória do processo. Isso
+# significa que a sessão sobrevive não só a um F5, mas também a um restart
+# do servidor (Ctrl+C + rodar de novo, ou um redeploy no Streamlit Cloud),
+# desde que SESSION_SECRET_KEY esteja configurada nos Secrets (veja
+# abaixo) -- sem isso, cada restart gera uma chave nova sozinho, e a sessão
+# se comporta como antes (só sobrevive a F5, não a restart).
+#
+# O PORQUE de 1h (em vez de algo maior): pesado o suficiente pra não pedir
+# login toda hora, mas curto o bastante para limitar até onde um cookie
+# vazado (cenário raro -- acesso físico ao navegador de alguém, por
+# exemplo) continuaria valendo, mesmo sobrevivendo a um restart do
+# servidor. Se 1h se mostrar curto demais no uso real (pedindo login com
+# frequência incômoda), é só aumentar este número.
+SESSION_TTL_HOURS = 1
 
 # O PORQUE: chave que assina (HMAC) o token de sessão. NÃO é uma senha de
 # ninguém -- é só um segredo do servidor usado pra garantir que o token não
@@ -134,9 +142,27 @@ ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "").strip()
 _REVOKED_TOKENS = set()
 
 
+def _obter_user_agent_hash() -> str:
+    # O PORQUE: usado para "amarrar" o token de sessão ao navegador que fez
+    # login. Se alguém copiar a URL (com o token de sessão) e colar em
+    # outro navegador/dispositivo, o User-Agent enviado é diferente, e o
+    # token passa a ser recusado mesmo estando corretamente assinado --
+    # trava exatamente o cenário relatado (copiar/colar o link em outro
+    # navegador). Não é uma garantia absoluta (um atacante deliberado pode
+    # forjar esse cabeçalho), mas é uma camada de defesa real contra o caso
+    # comum, sem custo nenhum de UX pra quem só está dando F5 no mesmo
+    # navegador (o User-Agent não muda entre um F5 e outro).
+    try:
+        ua = st.context.headers.get("User-Agent", "") or ""
+    except Exception:
+        ua = ""
+    return hashlib.sha256(ua.encode("utf-8")).hexdigest()[:16]
+
+
 def _criar_sessao(username: str) -> str:
     expires_at = (datetime.now() + timedelta(hours=SESSION_TTL_HOURS)).isoformat()
-    payload = f"{username}|{expires_at}"
+    ua_hash = _obter_user_agent_hash()
+    payload = f"{username}|{expires_at}|{ua_hash}"
     payload_b64 = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("utf-8").rstrip("=")
     signature = hmac.new(SESSION_SECRET_KEY.encode("utf-8"), payload_b64.encode("utf-8"), digestmod="sha256").hexdigest()
     return f"{payload_b64}.{signature}"
@@ -159,18 +185,59 @@ def _validar_sessao(token: str):
     try:
         padding = "=" * (-len(payload_b64) % 4)
         payload = base64.urlsafe_b64decode(payload_b64 + padding).decode("utf-8")
-        username, expires_at_iso = payload.rsplit("|", 1)
+        username, expires_at_iso, ua_hash_esperado = payload.rsplit("|", 2)
         expires_at = datetime.fromisoformat(expires_at_iso)
     except Exception:
         return None
 
     if datetime.now() > expires_at:
         return None
+
+    # O PORQUE: aqui é onde a amarração ao navegador é de fato aplicada --
+    # compara o hash do User-Agent gravado na criação do token com o do
+    # navegador que está tentando usá-lo agora.
+    if _obter_user_agent_hash() != ua_hash_esperado:
+        return None
+
     return username
 
 
 def _revogar_sessao(token: str):
     _REVOKED_TOKENS.add(token)
+
+
+# O PORQUE: nome do cookie que carrega o token de sessão. Curto e específico
+# o bastante pra não colidir com outros cookies do navegador.
+_COOKIE_SESSAO = "ttk_session"
+
+
+def _definir_cookie_sessao(token: str):
+    # O PORQUE: isto é "fire-and-forget" de propósito -- só grava o cookie
+    # no navegador, sem esperar nem recarregar nada. A sessão ATUAL não
+    # depende do cookie pra funcionar (st.session_state.authenticated já
+    # foi setado direto em Python, logo acima de onde esta função é
+    # chamada) -- o cookie só importa pra uma FUTURA abertura da página
+    # (F5, reabrir a aba), quando um st.session_state novo (vazio) precisa
+    # descobrir que já existe um login válido. Como document.cookie é
+    # síncrono no navegador, o cookie já está gravado assim que este
+    # componente é renderizado -- não precisa de reload nem de clique
+    # nenhum para a sessão atual continuar.
+    max_age = int(SESSION_TTL_HOURS * 3600)
+    st.components.v1.html(
+        f'<script>document.cookie = "{_COOKIE_SESSAO}={token}; max-age={max_age}; path=/; SameSite=Lax";</script>',
+        height=0,
+    )
+
+
+def _limpar_cookie_sessao():
+    # O PORQUE: mesmo raciocínio -- só apaga o cookie (max-age=0) pra uma
+    # FUTURA abertura da página não encontrar mais uma sessão válida. A
+    # sessão atual já é encerrada separadamente, limpando st.session_state
+    # (ver _limpar_sessao_local).
+    st.components.v1.html(
+        f'<script>document.cookie = "{_COOKIE_SESSAO}=; max-age=0; path=/; SameSite=Lax";</script>',
+        height=0,
+    )
 
 
 
@@ -254,8 +321,12 @@ def _dialog_confirmar_logout():
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Sim, sair", type="primary", use_container_width=True):
-            with st.spinner("Encerrando sessão..."):
-                _limpar_sessao_local()
+            # O PORQUE: só marcamos a intenção aqui e saímos do diálogo com
+            # um rerun normal -- rodar a limpeza de cookie/sessão (que
+            # termina com st.stop()) DE DENTRO do callback do diálogo se
+            # mostrou instável (loop). A limpeza de verdade acontece um
+            # pouco mais abaixo no script, fora de qualquer modal.
+            st.session_state["_solicitar_logout"] = True
             st.rerun()
     with col2:
         if st.button("Cancelar", use_container_width=True):
@@ -308,7 +379,7 @@ def _tela_login():
                 st.session_state.auth_username = username
                 st.session_state.auth_token = token
                 st.session_state.user_role = "admin"
-                st.query_params["s"] = token
+                _definir_cookie_sessao(token)
                 st.rerun()
             else:
                 st.error("Usuário ou senha incorretos.")
@@ -344,14 +415,29 @@ def _tela_login():
                         _dialog_confirmar_solicitacao(req_nome.strip(), email_normalizado, req_justificativa.strip())
 
 
+if st.session_state.get("_solicitar_logout"):
+    # O PORQUE: rodar isso aqui, fora de qualquer diálogo/modal, é o que
+    # resolve o loop relatado ao confirmar "Sair" dentro do modal.
+    _limpar_cookie_sessao()
+    _limpar_sessao_local()
+    st.rerun()
+
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
     # O PORQUE: primeira execução desta aba/sessão (ex.: acabou de dar F5).
-    # Antes de exigir login de novo, verifica se a URL já traz um token de
-    # uma sessão anterior ainda válida (?s=...) -- se validar, restaura o
-    # login automaticamente, sem pedir usuário/senha de novo.
-    qp_token = st.query_params.get("s")
+    # Antes de exigir login de novo, verifica se o NAVEGADOR já tem um
+    # cookie de uma sessão anterior ainda válida -- se validar, restaura o
+    # login automaticamente, sem pedir usuário/senha de novo. Usar cookie
+    # (em vez do token na URL, como era antes) é essencial: um cookie não
+    # viaja quando você copia/cola o endereço da página, então colar o link
+    # em outro navegador/aba anônima NÃO loga mais ninguém -- só o
+    # navegador que genuinamente recebeu o cookie no login continua
+    # autenticado.
+    try:
+        qp_token = st.context.cookies.get(_COOKIE_SESSAO)
+    except Exception:
+        qp_token = None
     if qp_token:
         qp_username = _validar_sessao(qp_token)
         if qp_username:
@@ -1102,6 +1188,26 @@ def reset_states(full_reset=False):
             st.session_state.pop(k, None)
 
 
+def reset_add_form_stay():
+    # O PORQUE: usado pelo botão "Salvar e Novo" -- limpa os campos do
+    # formulário (igual reset_states faria), MAS mantém view_state='add',
+    # pra continuar na tela de registro em vez de voltar pra listagem. Só é
+    # seguro chamar isso durante o bloqueio de tela cheia (dentro do
+    # dispatcher, com processing=True) -- é o único momento em que os
+    # widgets do formulário ainda não foram desenhados nesta execução, e
+    # portanto ainda é permitido escrever nas keys deles.
+    st.session_state.confirm_state = None
+    st.session_state.pending_data = {}
+    st.session_state.target_id = None
+    for k in ("add_proj_select", "add_proj_new_text", "add_cat_select", "add_cat_new_text"):
+        st.session_state.pop(k, None)
+    st.session_state["add_description"] = ""
+    st.session_state["add_effort"] = 1.0
+    st.session_state["add_log_date"] = datetime.today().date()
+    st.session_state["add_is_impedimento"] = False
+    st.session_state["add_is_duvida"] = False
+
+
 # ==========================================
 # CONFIRMAÇÃO + "PROCESSANDO..." (genérico)
 # ==========================================
@@ -1206,6 +1312,16 @@ def render_pending_confirmation():
 
 
 def execute_processing_action(action: dict) -> bool:
+    # O PORQUE: segunda camada de proteção -- todas as ações daqui pra baixo
+    # escrevem no banco (ou chamam a IA em nome do usuário). A tela já
+    # esconde os botões que disparam essas ações para quem está logado como
+    # convidado, mas não confiamos só nisso: se por algum motivo futuro um
+    # botão administrativo ficar visível/alcançável por engano, o backend
+    # recusa aqui mesmo assim, antes de tocar no banco.
+    if st.session_state.get("user_role") != "admin":
+        action["failure_message"] = "Ação não permitida para o seu nível de acesso."
+        return False
+
     t = action["type"]
     p = action["payload"]
     username = _current_user()
@@ -1239,7 +1355,11 @@ def execute_processing_action(action: dict) -> bool:
     elif t == "insert_log":
         d = p
         repo.insert_log(username, d['date'], d['proj'], d['cat'], d['desc'], d['eff'], d.get('imp', False), d.get('duv', False))
-        reset_states(full_reset=True)
+        if d.get('continuar_adicionando'):
+            reset_add_form_stay()
+            action["success_message"] = "Registro salvo! Formulário pronto para o próximo."
+        else:
+            reset_states(full_reset=True)
         return True
 
     elif t == "update_log":
@@ -2126,13 +2246,18 @@ with tab_manage:
         with col_duv:
             is_duvida = st.checkbox("❓ É uma dúvida?", key="add_is_duvida")
 
-        col_save, col_canc = st.columns(2)
+        col_save, col_save_new, col_canc = st.columns(3)
         with col_save:
             btn_save = st.button("Salvar Registro", type="primary", use_container_width=True, key="add_btn_save")
+        with col_save_new:
+            btn_save_new = st.button(
+                "💾➕ Salvar e Novo", use_container_width=True, key="add_btn_save_new",
+                help="Salva este registro e já abre o formulário limpo para o próximo.",
+            )
         with col_canc:
             btn_canc = st.button("Cancelar", use_container_width=True, key="add_btn_canc")
 
-        if btn_save:
+        if btn_save or btn_save_new:
             erros = validar_formulario_atividade(description, effort_hours)
             if not project:
                 erros.append("Selecione um **Projeto** ou digite e confirme um nome novo.")
@@ -2145,6 +2270,11 @@ with tab_manage:
                 st.session_state.pending_data = {
                     'date': str(log_date), 'proj': project, 'cat': category, 'desc': description, 'eff': effort_hours,
                     'imp': is_impedimento, 'duv': is_duvida,
+                    # O PORQUE: essa flag viaja até o dispatcher (ver "insert_log"
+                    # em execute_processing_action) para decidir, depois de salvar,
+                    # se volta pra listagem (Salvar Registro normal) ou fica no
+                    # formulário já limpo pra próxima tarefa (Salvar e Novo).
+                    'continuar_adicionando': bool(btn_save_new),
                 }
                 st.session_state.confirm_state = 'save_add'
                 st.rerun()
