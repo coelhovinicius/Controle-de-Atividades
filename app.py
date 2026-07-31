@@ -523,6 +523,43 @@ st.markdown(
         margin-right: auto;
     }
 
+    /* O PORQUE: a grid de Registro de Atividades usa st.columns() (7
+       colunas: ID/Data/Projeto/Categoria/Descrição/Horas/Ações) uma vez
+       por linha de cabeçalho e uma vez por registro. Por padrão, o
+       Streamlit EMPILHA colunas em telas estreitas -- ótimo pra um par de
+       botões, péssimo aqui: cada tarefa da lista viraria 7 blocos
+       empilhados, tornando a lista enorme e impossível de escanear no
+       celular.
+       TENTATIVA ANTERIOR (removida): um min-width de 600px num seletor
+       genérico demais acabou grudando em CADA coluna individualmente (não
+       só na linha inteira), fazendo a coluna "ID" sozinha ficar mais larga
+       que a tela do celular. Corrigido usando ">" (filho direto, não
+       qualquer descendente) e um valor bem mais modesto -- mesmo que o
+       seletor pegue algo a mais do que o previsto, o estrago é pequeno,
+       não catastrófico como antes.
+    */
+    .st-key-atividades_grid {
+        overflow-x: auto;
+        padding-bottom: 6px;
+    }
+    .st-key-atividades_grid [data-testid="stHorizontalBlock"] {
+        flex-wrap: nowrap !important;
+    }
+    .st-key-atividades_grid [data-testid="stHorizontalBlock"] > div {
+        min-width: 45px !important;
+        flex-shrink: 1 !important;
+    }
+    @media (max-width: 640px) {
+        .st-key-atividades_grid [data-testid="stMarkdownContainer"] p,
+        .st-key-atividades_grid [data-testid="stMarkdownContainer"] div,
+        .st-key-atividades_grid button {
+            font-size: 0.72rem !important;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+    }
+
     /* Tablets e notebooks menores: só reduz um pouco o padding lateral */
     @media (max-width: 992px) {
         .main .block-container {
@@ -2213,72 +2250,73 @@ with tab_manage:
                         st.rerun()
 
                 st.markdown("---")
-                grid_cols = st.columns([0.5, 1, 1.5, 2, 4, 1, 1.5])
-                headers = ["ID", "Data", "Projeto", "Categoria", "Descrição", "Horas", "Ações"]
-                for col, header in zip(grid_cols, headers):
-                    if header in SORTABLE_COLUMNS:
-                        col_key = SORTABLE_COLUMNS[header]
-                        # O PORQUE: seta simples (▲/▼, caractere de texto puro)
-                        # em vez de emoji colorido (🔼/🔽) -- o emoji, além de
-                        # renderizar grande/colorido dependendo da fonte do
-                        # sistema, podia até quebrar linha dentro do botão em
-                        # colunas estreitas, fazendo a seta cair pra baixo do
-                        # texto do cabeçalho. ▲/▼ é pequeno, mono, e fica
-                        # sempre na mesma linha, à direita do título -- o
-                        # mesmo padrão usado em qualquer tabela de banco.
-                        if st.session_state.sort_column == col_key:
-                            arrow = " ▲" if st.session_state.sort_ascending else " ▼"
-                        else:
-                            arrow = ""
-                        if col.button(f"{header}{arrow}", key=f"sort_btn_{col_key}", use_container_width=True):
+                with st.container(key="atividades_grid"):
+                    grid_cols = st.columns([0.5, 1, 1.5, 2, 4, 1, 1.5])
+                    headers = ["ID", "Data", "Projeto", "Categoria", "Descrição", "Horas", "Ações"]
+                    for col, header in zip(grid_cols, headers):
+                        if header in SORTABLE_COLUMNS:
+                            col_key = SORTABLE_COLUMNS[header]
+                            # O PORQUE: seta simples (▲/▼, caractere de texto puro)
+                            # em vez de emoji colorido (🔼/🔽) -- o emoji, além de
+                            # renderizar grande/colorido dependendo da fonte do
+                            # sistema, podia até quebrar linha dentro do botão em
+                            # colunas estreitas, fazendo a seta cair pra baixo do
+                            # texto do cabeçalho. ▲/▼ é pequeno, mono, e fica
+                            # sempre na mesma linha, à direita do título -- o
+                            # mesmo padrão usado em qualquer tabela de banco.
                             if st.session_state.sort_column == col_key:
-                                # O PORQUE: clicar de novo na mesma coluna
-                                # inverte a direção (asc -> dsc -> asc ...).
-                                st.session_state.sort_ascending = not st.session_state.sort_ascending
+                                arrow = " ▲" if st.session_state.sort_ascending else " ▼"
                             else:
-                                st.session_state.sort_column = col_key
-                                st.session_state.sort_ascending = True
-                            st.session_state.current_page = 1
-                            st.rerun()
-                    else:
-                        col.markdown(f"**{header}**")
-
-                start_idx = (st.session_state.current_page - 1) * items_per_page
-                end_idx = start_idx + items_per_page
-                df_page = df_display.iloc[start_idx:end_idx]
-
-                for _, row in df_page.iterrows():
-                    cols = st.columns([0.5, 1, 1.5, 2, 4, 1, 1.5])
-                    cols[0].write(str(row["id"]))
-                    cols[1].write(format_date_ptbr(row["log_date"]))
-                    cols[2].write(row["project"])
-                    cols[3].write(row["category"])
-                    # O PORQUE: prefixo visual (não altera o texto salvo) para
-                    # identificar de relance quais registros estão marcados
-                    # como Impedimento e/ou Dúvida sem precisar abrir cada um.
-                    flag_prefix = ""
-                    if bool(int(row.get("is_impedimento", 0) or 0)):
-                        flag_prefix += "🚧 "
-                    if bool(int(row.get("is_duvida", 0) or 0)):
-                        flag_prefix += "❓ "
-                    cols[4].write(f"{flag_prefix}{row['description']}")
-                    cols[5].write(str(row["effort_hours"]))
-
-                    with cols[6]:
-                        if is_admin:
-                            btn_col1, btn_col2 = st.columns(2)
-                            with btn_col1:
-                                if st.button("✏️", key=f"edit_{row['id']}", help="Editar"):
-                                    st.session_state.target_id = row['id']
-                                    st.session_state.view_state = 'edit'
-                                    st.rerun()
-                            with btn_col2:
-                                if st.button("🗑️", key=f"del_{row['id']}", help="Excluir"):
-                                    st.session_state.target_id = row['id']
-                                    st.session_state.confirm_state = 'delete'
-                                    st.rerun()
+                                arrow = ""
+                            if col.button(f"{header}{arrow}", key=f"sort_btn_{col_key}", use_container_width=True):
+                                if st.session_state.sort_column == col_key:
+                                    # O PORQUE: clicar de novo na mesma coluna
+                                    # inverte a direção (asc -> dsc -> asc ...).
+                                    st.session_state.sort_ascending = not st.session_state.sort_ascending
+                                else:
+                                    st.session_state.sort_column = col_key
+                                    st.session_state.sort_ascending = True
+                                st.session_state.current_page = 1
+                                st.rerun()
                         else:
-                            st.write("")
+                            col.markdown(f"**{header}**")
+
+                    start_idx = (st.session_state.current_page - 1) * items_per_page
+                    end_idx = start_idx + items_per_page
+                    df_page = df_display.iloc[start_idx:end_idx]
+
+                    for _, row in df_page.iterrows():
+                        cols = st.columns([0.5, 1, 1.5, 2, 4, 1, 1.5])
+                        cols[0].write(str(row["id"]))
+                        cols[1].write(format_date_ptbr(row["log_date"]))
+                        cols[2].write(row["project"])
+                        cols[3].write(row["category"])
+                        # O PORQUE: prefixo visual (não altera o texto salvo) para
+                        # identificar de relance quais registros estão marcados
+                        # como Impedimento e/ou Dúvida sem precisar abrir cada um.
+                        flag_prefix = ""
+                        if bool(int(row.get("is_impedimento", 0) or 0)):
+                            flag_prefix += "🚧 "
+                        if bool(int(row.get("is_duvida", 0) or 0)):
+                            flag_prefix += "❓ "
+                        cols[4].write(f"{flag_prefix}{row['description']}")
+                        cols[5].write(str(row["effort_hours"]))
+
+                        with cols[6]:
+                            if is_admin:
+                                btn_col1, btn_col2 = st.columns(2)
+                                with btn_col1:
+                                    if st.button("✏️", key=f"edit_{row['id']}", help="Editar"):
+                                        st.session_state.target_id = row['id']
+                                        st.session_state.view_state = 'edit'
+                                        st.rerun()
+                                with btn_col2:
+                                    if st.button("🗑️", key=f"del_{row['id']}", help="Excluir"):
+                                        st.session_state.target_id = row['id']
+                                        st.session_state.confirm_state = 'delete'
+                                        st.rerun()
+                            else:
+                                st.write("")
                 st.markdown("---")
 
     if st.session_state.view_state == 'add':
