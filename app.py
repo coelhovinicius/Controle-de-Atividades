@@ -8,6 +8,7 @@ import unicodedata
 import time
 import os
 import sys
+import io
 import hmac
 import base64
 import hashlib
@@ -727,6 +728,117 @@ def apply_responsive_layout(fig, rotate_xaxis: bool = False):
     if rotate_xaxis:
         fig.update_xaxes(tickangle=-45, tickfont=dict(size=10))
     return fig
+
+
+def _grafico_barras_mpl(df: pd.DataFrame, x_col: str, y_col: str, titulo: str, xlabel: str, ylabel: str,
+                         cor_col: str = None, figsize=(8, 4.3)):
+    # O PORQUE: matplotlib (não Plotly/kaleido) para os gráficos do PDF --
+    # ver justificativa completa em gerar_pdf_relatorio(). "Agg" é o
+    # backend sem tela do matplotlib, o correto para rodar num servidor
+    # (sem monitor conectado).
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=figsize)
+    if cor_col:
+        pivot = df.pivot_table(index=x_col, columns=cor_col, values=y_col, aggfunc="sum", fill_value=0)
+        pivot.plot(kind="bar", ax=ax)
+        ax.legend(fontsize=8)
+    else:
+        agrupado = df.groupby(x_col)[y_col].sum().sort_values(ascending=False)
+        agrupado.plot(kind="bar", ax=ax, color="#636EFA")
+    ax.set_title(titulo, fontsize=13)
+    ax.set_xlabel(xlabel, fontsize=10)
+    ax.set_ylabel(ylabel, fontsize=10)
+    plt.setp(ax.get_xticklabels(), rotation=30, ha="right", fontsize=8)
+    fig.tight_layout()
+    return fig
+
+
+def _grafico_pizza_mpl(df: pd.DataFrame, nomes_col: str, valores_col: str, titulo: str, figsize=(6, 5)):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=figsize)
+    agrupado = df.groupby(nomes_col)[valores_col].sum()
+    ax.pie(agrupado.values, labels=agrupado.index, autopct="%1.0f%%", textprops={"fontsize": 9})
+    ax.set_title(titulo, fontsize=13)
+    fig.tight_layout()
+    return fig
+
+
+def _mpl_fig_para_png_bytes(fig, dpi: int = 150) -> bytes:
+    import matplotlib.pyplot as plt
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def gerar_pdf_relatorio(titulo: str, subtitulo: str, paragrafos: list, figuras: list) -> bytes:
+    """
+    Monta um PDF simples (título + parágrafos de texto + gráficos) e
+    devolve os bytes prontos para usar em st.download_button.
+
+    paragrafos: lista de itens -- cada item é uma string (parágrafo normal)
+    ou uma tupla (texto, nome_do_estilo) para usar um estilo diferente
+    (ex.: ("O que fiz ontem:", "Heading4")). Uma string vazia ("") vira um
+    espaçamento em branco entre blocos. O PORQUE de usar (texto, estilo) em
+    vez de tags tipo "<b>...</b>" dentro do texto: todo texto passa por um
+    escape de <, > e & (necessário pra uma descrição de tarefa com esses
+    caracteres não quebrar o PDF) -- se o negrito fosse uma tag embutida no
+    mesmo texto, o escape anularia a tag também. Separar "o quê" (texto) de
+    "como" (estilo) evita esse conflito.
+    figuras: lista de tuplas (legenda: str, fig: matplotlib.figure.Figure)
+    -- use _grafico_barras_mpl()/_grafico_pizza_mpl() para montar cada uma
+    a partir de um DataFrame, não os objetos Plotly usados na tela (Plotly
+    é interativo; dentro de um PDF só existe imagem estática).
+    """
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer, pagesize=A4,
+        topMargin=20 * mm, bottomMargin=20 * mm, leftMargin=18 * mm, rightMargin=18 * mm,
+    )
+    styles = getSampleStyleSheet()
+    largura_util = A4[0] - 36 * mm
+
+    story = [Paragraph(titulo, styles["Title"])]
+    if subtitulo:
+        story.append(Paragraph(subtitulo, styles["Normal"]))
+    story.append(Spacer(1, 10 * mm))
+
+    for item in paragrafos:
+        if item == "":
+            story.append(Spacer(1, 4 * mm))
+            continue
+        texto, nome_estilo = item if isinstance(item, tuple) else (item, "Normal")
+        # O PORQUE: escapa < > & antes de passar pro Paragraph -- ele
+        # interpreta o texto como XML/HTML simplificado (é assim que
+        # <sub>/<super>/<b> funcionam internamente no reportlab), então um
+        # "&" ou "<" cru dentro de uma descrição de tarefa, por exemplo,
+        # quebraria a geração do PDF em vez de aparecer como texto.
+        texto_seguro = str(texto).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        story.append(Paragraph(texto_seguro, styles[nome_estilo]))
+
+    for legenda, fig in figuras:
+        story.append(Spacer(1, 8 * mm))
+        story.append(Paragraph(legenda, styles["Heading3"]))
+        story.append(Spacer(1, 2 * mm))
+        png_bytes = _mpl_fig_para_png_bytes(fig)
+        altura_proporcional = largura_util * 0.55
+        story.append(RLImage(io.BytesIO(png_bytes), width=largura_util, height=altura_proporcional))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 # O PORQUE: Limite de upload em MB. O valor "oficial" (que barra o arquivo
@@ -2649,15 +2761,71 @@ if is_admin:
             st.markdown("---")
             if pending_changes:
                 st.info("⚠️ Salve as alterações no texto corrido acima para liberar o download.")
-            st.download_button(
-                label="⬇️ Baixar Resumo da Daily (.txt)",
-                data=rep["report_txt"].encode("utf-8"),
-                file_name=f"daily_{datetime.today().strftime('%Y%m%d')}.txt",
-                mime="text/plain",
-                use_container_width=True,
-                type="primary",
-                disabled=pending_changes,
-            )
+            c_down_txt, c_down_pdf = st.columns(2)
+            with c_down_txt:
+                st.download_button(
+                    label="⬇️ Baixar Resumo da Daily (.txt)",
+                    data=rep["report_txt"].encode("utf-8"),
+                    file_name=f"daily_{datetime.today().strftime('%Y%m%d')}.txt",
+                    mime="text/plain",
+                    use_container_width=True,
+                    type="primary",
+                    disabled=pending_changes,
+                )
+            with c_down_pdf:
+                if st.button("📄 Gerar PDF da Daily", use_container_width=True, disabled=pending_changes):
+                    with st.spinner("Montando o PDF..."):
+                        paragrafos_pdf = [
+                            (f"O que fiz ontem ({rep['d_ontem'].strftime('%d/%m/%Y')}):", "Heading4"),
+                        ]
+                        if rep["df_ontem"].empty:
+                            paragrafos_pdf.append("Sem registros mapeados.")
+                        else:
+                            for _, row in rep["df_ontem"].iterrows():
+                                paragrafos_pdf.append(f"• [{row['project']}] {row['description']} ({row['effort_hours']}h)")
+                        paragrafos_pdf.append("")
+                        paragrafos_pdf.append((f"O que farei hoje ({rep['d_hoje'].strftime('%d/%m/%Y')}):", "Heading4"))
+                        if rep["df_hoje"].empty:
+                            paragrafos_pdf.append("Sem registros mapeados.")
+                        else:
+                            for _, row in rep["df_hoje"].iterrows():
+                                paragrafos_pdf.append(f"• [{row['project']}] {row['description']} ({row['effort_hours']}h)")
+                        paragrafos_pdf.append("")
+                        paragrafos_pdf.append(("Impedimentos:", "Heading4"))
+                        paragrafos_pdf.append(rep['impedimentos'] or "Nenhum.")
+                        paragrafos_pdf.append("")
+                        paragrafos_pdf.append(("Dúvidas:", "Heading4"))
+                        paragrafos_pdf.append(rep['duvidas'] or "Nenhuma.")
+
+                        # O PORQUE: gráfico "respectivo" pedido -- mostra as horas
+                        # do próprio período da Daily (ontem + hoje) por projeto,
+                        # reaproveitando os mesmos dados já calculados pro resumo em
+                        # texto, sem precisar consultar o banco de novo.
+                        figuras_pdf = []
+                        df_daily_combo = pd.concat([
+                            rep["df_ontem"].assign(Período=f"Ontem ({rep['d_ontem'].strftime('%d/%m')})"),
+                            rep["df_hoje"].assign(Período=f"Hoje ({rep['d_hoje'].strftime('%d/%m')})"),
+                        ], ignore_index=True) if not (rep["df_ontem"].empty and rep["df_hoje"].empty) else pd.DataFrame()
+
+                        if not df_daily_combo.empty:
+                            fig_daily_pdf = _grafico_barras_mpl(
+                                df_daily_combo, "project", "effort_hours",
+                                "Horas por Projeto (Ontem x Hoje)", "Projeto", "Horas",
+                                cor_col="Período",
+                            )
+                            figuras_pdf.append(("Horas por Projeto (Ontem x Hoje)", fig_daily_pdf))
+
+                        pdf_bytes = gerar_pdf_relatorio(
+                            titulo="Resumo para a Daily",
+                            subtitulo=f"Gerado em {datetime.today().strftime('%d/%m/%Y %H:%M')}",
+                            paragrafos=paragrafos_pdf,
+                            figuras=figuras_pdf,
+                        )
+                    st.download_button(
+                        label="⬇️ Baixar PDF pronto", data=pdf_bytes,
+                        file_name=f"daily_{datetime.today().strftime('%Y%m%d')}.pdf",
+                        mime="application/pdf", use_container_width=True, type="primary",
+                    )
 
     # ==========================================
     # TAB 3: DASHBOARD, RELATÓRIOS E EXPORTAÇÃO
@@ -3101,11 +3269,52 @@ with tab_dashboard:
                             flag_prefix += "[DÚVIDA] "
                         report_text += f"[{row['Data_PTBR']}] {row['project']} | {row['category']} \n  -> {flag_prefix}{row['description']} ({row['effort_hours']}h)\n\n"
 
-                    c_down_csv, c_down_txt = st.columns(2)
+                    c_down_csv, c_down_txt, c_down_pdf = st.columns(3)
                     with c_down_csv:
                         st.download_button(label="Baixar Planilha (.csv)", data=csv_data, file_name=f"extrato_atividades_{start_date}_{end_date}.csv", mime="text/csv", use_container_width=True)
                     with c_down_txt:
                         st.download_button(label="Baixar Relatório (.txt)", data=report_text, file_name=f"relatorio_atividades_{start_date}_{end_date}.txt", mime="text/plain", use_container_width=True)
+                    with c_down_pdf:
+                        # O PORQUE: gerado só quando o botão é clicado (não a cada
+                        # rerun da aba) -- montar o PDF envolve renderizar cada
+                        # gráfico como imagem, mais pesado que só montar um
+                        # texto/CSV; não vale a pena pagar esse custo antes de o
+                        # usuário realmente pedir o arquivo. Os gráficos do PDF são
+                        # reconstruídos com matplotlib a partir de df_filtered (não
+                        # são os mesmos objetos Plotly da tela) -- ver justificativa
+                        # em gerar_pdf_relatorio().
+                        if st.button("📄 Gerar PDF do Dashboard", use_container_width=True):
+                            with st.spinner("Montando o PDF (isso pode levar alguns segundos)..."):
+                                paragrafos_pdf = [
+                                    f"Total de Registros: {len(df_filtered)}",
+                                    f"Total de Horas: {df_filtered['effort_hours'].sum():.2f}h",
+                                    f"Média de Horas/Dia (dias com registro): {media_horas_dia:.2f}h",
+                                    f"% Impedimentos: {pct_impedimento:.0f}%  |  % Dúvidas: {pct_duvida:.0f}%",
+                                ]
+                                figuras_pdf = [
+                                    ("Horas por Projeto", _grafico_barras_mpl(
+                                        df_filtered, "project", "effort_hours", "Horas por Projeto", "Projeto", "Horas",
+                                    )),
+                                    ("Horas por Categoria", _grafico_pizza_mpl(
+                                        df_filtered, "category", "effort_hours", "Horas por Categoria",
+                                    )),
+                                ]
+                                df_por_data = df_filtered.groupby("Data_PTBR", sort=False)["effort_hours"].sum().reset_index()
+                                if len(df_por_data) > 1:
+                                    figuras_pdf.append(("Horas por Data", _grafico_barras_mpl(
+                                        df_por_data, "Data_PTBR", "effort_hours", "Horas por Data", "Data", "Horas",
+                                    )))
+                                pdf_bytes = gerar_pdf_relatorio(
+                                    titulo="Relatório do Dashboard",
+                                    subtitulo=f"Período: {start_date.strftime('%d/%m/%Y')} a {end_date.strftime('%d/%m/%Y')}",
+                                    paragrafos=paragrafos_pdf,
+                                    figuras=figuras_pdf,
+                                )
+                            st.download_button(
+                                label="⬇️ Baixar PDF pronto", data=pdf_bytes,
+                                file_name=f"dashboard_{start_date}_{end_date}.pdf",
+                                mime="application/pdf", use_container_width=True, type="primary",
+                            )
                     st.caption(
                         "Se algum número aparecer errado ao abrir a planilha no Excel, use "
                         "Dados > Obter Dados > De Texto/CSV (em vez de dar duplo-clique no arquivo) "

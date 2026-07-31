@@ -22,3 +22,12 @@ bcrypt>=4.1
 # essa dependência explícita, em vez de confiar que uma versão futura do
 # Streamlit continue trazendo requests "de brinde".
 requests>=2.27
+# O PORQUE: reportlab monta o PDF em si (texto + imagens). Para os
+# gráficos dentro do PDF, uso matplotlib (não o Plotly diretamente) --
+# Plotly precisaria do kaleido para virar imagem estática, e o kaleido tem
+# um bug antigo e nunca resolvido (issues abertas desde 2020) de travar
+# indefinidamente no Windows sem erro nenhum. matplotlib é Python puro,
+# sem subprocesso/navegador nenhum por trás -- não tem essa categoria de
+# problema, e já testei rodando de ponta a ponta antes de entregar.
+reportlab>=4.0
+matplotlib>=3.8
