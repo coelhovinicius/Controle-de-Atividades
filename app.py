@@ -767,8 +767,37 @@ def apply_responsive_layout(fig, rotate_xaxis: bool = False):
     return fig
 
 
+# O PORQUE: paleta única, usada tanto nos gráficos (matplotlib) quanto nas
+# tabelas/cabeçalho (reportlab) dos PDFs -- dá uma identidade visual
+# consistente ao relatório, em vez de cada gráfico sair com as cores
+# padrão (aleatórias) do matplotlib.
+PDF_COR_PRIMARIA = "#FF4B4B"
+PDF_COR_TEXTO = "#262730"
+PDF_COR_MUTED = "#6E6E6E"
+PDF_COR_FUNDO_CLARO = "#F7F7F9"
+PDF_PALETA_GRAFICOS = ["#FF4B4B", "#4B7BFF", "#2CA58D", "#F2A65A", "#8E7DBE", "#5FA8D3", "#D45D79", "#8CC63F"]
+
+
+def _aplicar_estilo_mpl():
+    import matplotlib.pyplot as plt
+    plt.rcParams.update({
+        "axes.edgecolor": "#DDDDDD",
+        "axes.linewidth": 0.8,
+        "axes.grid": True,
+        "grid.color": "#EEEEEE",
+        "grid.linewidth": 0.8,
+        "axes.axisbelow": True,
+        "text.color": PDF_COR_TEXTO,
+        "axes.labelcolor": PDF_COR_TEXTO,
+        "xtick.color": "#444444",
+        "ytick.color": "#444444",
+        "figure.facecolor": "white",
+        "axes.facecolor": "white",
+    })
+
+
 def _grafico_barras_mpl(df: pd.DataFrame, x_col: str, y_col: str, titulo: str, xlabel: str, ylabel: str,
-                         cor_col: str = None, figsize=(8, 4.3)):
+                         cor_col: str = None, figsize=(8, 4.3), mostrar_valores: bool = True):
     # O PORQUE: matplotlib (não Plotly/kaleido) para os gráficos do PDF --
     # ver justificativa completa em gerar_pdf_relatorio(). "Agg" é o
     # backend sem tela do matplotlib, o correto para rodar num servidor
@@ -776,18 +805,28 @@ def _grafico_barras_mpl(df: pd.DataFrame, x_col: str, y_col: str, titulo: str, x
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    _aplicar_estilo_mpl()
 
     fig, ax = plt.subplots(figsize=figsize)
     if cor_col:
         pivot = df.pivot_table(index=x_col, columns=cor_col, values=y_col, aggfunc="sum", fill_value=0)
-        pivot.plot(kind="bar", ax=ax)
-        ax.legend(fontsize=8)
+        pivot.plot(kind="bar", ax=ax, color=PDF_PALETA_GRAFICOS[:max(len(pivot.columns), 1)], edgecolor="white", linewidth=0.6)
+        ax.legend(frameon=False, fontsize=8)
     else:
         agrupado = df.groupby(x_col)[y_col].sum().sort_values(ascending=False)
-        agrupado.plot(kind="bar", ax=ax, color="#636EFA")
-    ax.set_title(titulo, fontsize=13)
-    ax.set_xlabel(xlabel, fontsize=10)
-    ax.set_ylabel(ylabel, fontsize=10)
+        cores = [PDF_PALETA_GRAFICOS[i % len(PDF_PALETA_GRAFICOS)] for i in range(len(agrupado))]
+        agrupado.plot(kind="bar", ax=ax, color=cores, edgecolor="white", linewidth=0.6)
+        if mostrar_valores:
+            # O PORQUE: rótulo do valor em cima de cada barra -- pedido
+            # explícito de relatório "mais detalhado", em vez de precisar
+            # olhar pro eixo pra estimar o número.
+            for i, v in enumerate(agrupado.values):
+                ax.text(i, v, f"{v:.1f}", ha="center", va="bottom", fontsize=8, color=PDF_COR_TEXTO)
+    ax.set_title(titulo, fontsize=13, fontweight="bold", color=PDF_COR_TEXTO, pad=12)
+    ax.set_xlabel(xlabel, fontsize=9)
+    ax.set_ylabel(ylabel, fontsize=9)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
     plt.setp(ax.get_xticklabels(), rotation=30, ha="right", fontsize=8)
     fig.tight_layout()
     return fig
@@ -797,16 +836,51 @@ def _grafico_pizza_mpl(df: pd.DataFrame, nomes_col: str, valores_col: str, titul
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    _aplicar_estilo_mpl()
 
     fig, ax = plt.subplots(figsize=figsize)
-    agrupado = df.groupby(nomes_col)[valores_col].sum()
-    ax.pie(agrupado.values, labels=agrupado.index, autopct="%1.0f%%", textprops={"fontsize": 9})
-    ax.set_title(titulo, fontsize=13)
+    agrupado = df.groupby(nomes_col)[valores_col].sum().sort_values(ascending=False)
+    cores = [PDF_PALETA_GRAFICOS[i % len(PDF_PALETA_GRAFICOS)] for i in range(len(agrupado))]
+    _, _, autotexts = ax.pie(
+        agrupado.values, labels=agrupado.index, autopct="%1.0f%%",
+        colors=cores, textprops={"fontsize": 9},
+        wedgeprops={"edgecolor": "white", "linewidth": 1.5},
+        pctdistance=0.75,
+    )
+    for at in autotexts:
+        at.set_color("white")
+        at.set_fontweight("bold")
+    ax.set_title(titulo, fontsize=13, fontweight="bold", color=PDF_COR_TEXTO, pad=12)
     fig.tight_layout()
     return fig
 
 
-def _mpl_fig_para_png_bytes(fig, dpi: int = 150) -> bytes:
+def _grafico_impedimentos_mpl(df: pd.DataFrame, x_col: str, figsize=(8, 4)):
+    # O PORQUE: gráfico novo, não existia nos PDFs antes -- responde "os
+    # impedimentos/dúvidas estão concentrados em algum período?", útil pra
+    # retro, e usa colunas (is_impedimento/is_duvida) que já vêm no
+    # DataFrame filtrado, sem precisar de consulta nova ao banco.
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    _aplicar_estilo_mpl()
+
+    agrupado = df.groupby(x_col)[["is_impedimento", "is_duvida"]].sum()
+    agrupado.columns = ["Impedimentos", "Dúvidas"]
+    fig, ax = plt.subplots(figsize=figsize)
+    agrupado.plot(kind="bar", stacked=True, ax=ax, color=["#FF4B4B", "#F2A65A"], edgecolor="white", linewidth=0.6)
+    ax.set_title("Impedimentos e Dúvidas ao Longo do Tempo", fontsize=13, fontweight="bold", color=PDF_COR_TEXTO, pad=12)
+    ax.set_xlabel("")
+    ax.set_ylabel("Quantidade", fontsize=9)
+    ax.legend(frameon=False, fontsize=8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    plt.setp(ax.get_xticklabels(), rotation=30, ha="right", fontsize=8)
+    fig.tight_layout()
+    return fig
+
+
+def _mpl_fig_para_png_bytes(fig, dpi: int = 170) -> bytes:
     import matplotlib.pyplot as plt
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
@@ -815,10 +889,11 @@ def _mpl_fig_para_png_bytes(fig, dpi: int = 150) -> bytes:
     return buf.getvalue()
 
 
-def gerar_pdf_relatorio(titulo: str, subtitulo: str, paragrafos: list, figuras: list) -> bytes:
+def gerar_pdf_relatorio(titulo: str, subtitulo: str, paragrafos: list = None, figuras: list = None,
+                         kpis: list = None, tabelas: list = None) -> bytes:
     """
-    Monta um PDF simples (título + parágrafos de texto + gráficos) e
-    devolve os bytes prontos para usar em st.download_button.
+    Monta um PDF (cabeçalho com marca, KPIs em destaque, texto, tabelas e
+    gráficos) e devolve os bytes prontos para usar em st.download_button.
 
     paragrafos: lista de itens -- cada item é uma string (parágrafo normal)
     ou uma tupla (texto, nome_do_estilo) para usar um estilo diferente
@@ -829,28 +904,91 @@ def gerar_pdf_relatorio(titulo: str, subtitulo: str, paragrafos: list, figuras: 
     caracteres não quebrar o PDF) -- se o negrito fosse uma tag embutida no
     mesmo texto, o escape anularia a tag também. Separar "o quê" (texto) de
     "como" (estilo) evita esse conflito.
+    kpis: lista opcional de tuplas (valor: str, rótulo: str) -- vira uma
+    fileira de "cartões" logo no topo (ex.: [("42h", "Total de Horas")]).
+    tabelas: lista opcional de tuplas (legenda: str, cabecalhos: list[str],
+    linhas: list[list[str]]) -- números exatos, complementando os gráficos
+    (que são melhores pra enxergar proporção/tendência, não pra ler um
+    valor preciso).
     figuras: lista de tuplas (legenda: str, fig: matplotlib.figure.Figure)
-    -- use _grafico_barras_mpl()/_grafico_pizza_mpl() para montar cada uma
-    a partir de um DataFrame, não os objetos Plotly usados na tela (Plotly
-    é interativo; dentro de um PDF só existe imagem estática).
+    -- use _grafico_barras_mpl()/_grafico_pizza_mpl()/_grafico_impedimentos_mpl()
+    para montar cada uma a partir de um DataFrame, não os objetos Plotly
+    usados na tela (Plotly é interativo; dentro de um PDF só existe imagem
+    estática).
     """
     from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import mm
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage
+    from reportlab.lib import colors as rl_colors
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, Table, TableStyle
+
+    paragrafos = paragrafos or []
+    figuras = figuras or []
+    kpis = kpis or []
+    tabelas = tabelas or []
+
+    cor_primaria = rl_colors.HexColor(PDF_COR_PRIMARIA)
+    cor_texto = rl_colors.HexColor(PDF_COR_TEXTO)
+    cor_muted = rl_colors.HexColor(PDF_COR_MUTED)
+    cor_fundo_claro = rl_colors.HexColor(PDF_COR_FUNDO_CLARO)
 
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer, pagesize=A4,
-        topMargin=20 * mm, bottomMargin=20 * mm, leftMargin=18 * mm, rightMargin=18 * mm,
+        topMargin=30 * mm, bottomMargin=18 * mm, leftMargin=18 * mm, rightMargin=18 * mm,
     )
-    styles = getSampleStyleSheet()
     largura_util = A4[0] - 36 * mm
 
-    story = [Paragraph(titulo, styles["Title"])]
+    base = getSampleStyleSheet()
+    estilos = {
+        "Title": ParagraphStyle("TituloRelatorio", parent=base["Title"], textColor=cor_texto, fontSize=19, spaceAfter=2, alignment=0),
+        "Normal": ParagraphStyle("CorpoRelatorio", parent=base["Normal"], textColor=cor_texto, fontSize=10, leading=14),
+        "Subtitulo": ParagraphStyle("SubtituloRelatorio", parent=base["Normal"], textColor=cor_muted, fontSize=10),
+        "Heading3": ParagraphStyle("SecaoRelatorio", parent=base["Heading3"], textColor=cor_primaria, fontSize=13, spaceBefore=2, spaceAfter=4),
+        "Heading4": ParagraphStyle("SubsecaoRelatorio", parent=base["Heading4"], textColor=cor_texto, fontSize=11, spaceBefore=2, spaceAfter=2),
+    }
+
+    def _cabecalho_rodape(canvas, documento):
+        # O PORQUE: SimpleDocTemplate não desenha cabeçalho/rodapé sozinho
+        # -- isso roda a cada página, via callback de baixo nível do
+        # reportlab (canvas), pra dar a faixa colorida no topo (identidade
+        # visual) e o rodapé com data de geração + número de página.
+        canvas.saveState()
+        canvas.setFillColor(cor_primaria)
+        canvas.rect(0, A4[1] - 14 * mm, A4[0], 14 * mm, fill=1, stroke=0)
+        canvas.setFillColor(rl_colors.white)
+        canvas.setFont("Helvetica-Bold", 13)
+        canvas.drawString(18 * mm, A4[1] - 9.5 * mm, "Task Tracker")
+        canvas.setFillColor(cor_muted)
+        canvas.setFont("Helvetica", 8)
+        canvas.drawString(18 * mm, 10 * mm, f"Gerado em {datetime.now().strftime('%d/%m/%Y às %H:%M')}")
+        canvas.drawRightString(A4[0] - 18 * mm, 10 * mm, f"Página {documento.page}")
+        canvas.restoreState()
+
+    story = [Paragraph(titulo, estilos["Title"])]
     if subtitulo:
-        story.append(Paragraph(subtitulo, styles["Normal"]))
-    story.append(Spacer(1, 10 * mm))
+        story.append(Paragraph(subtitulo, estilos["Subtitulo"]))
+    story.append(Spacer(1, 8 * mm))
+
+    if kpis:
+        # O PORQUE: cartões de KPI em vez de texto corrido -- leitura
+        # instantânea dos números principais, sem precisar ler frase por
+        # frase, igual aos cartões que já existem na tela do Dashboard.
+        linha_valores = [Paragraph(f"<font size=17 color='{PDF_COR_PRIMARIA}'><b>{v}</b></font>", estilos["Normal"]) for v, _ in kpis]
+        linha_rotulos = [Paragraph(f"<font size=8 color='{PDF_COR_MUTED}'>{l}</font>", estilos["Normal"]) for _, l in kpis]
+        largura_col = largura_util / len(kpis)
+        tabela_kpi = Table([linha_valores, linha_rotulos], colWidths=[largura_col] * len(kpis))
+        tabela_kpi.setStyle(TableStyle([
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("BACKGROUND", (0, 0), (-1, -1), cor_fundo_claro),
+            ("TOPPADDING", (0, 0), (-1, 0), 10),
+            ("BOTTOMPADDING", (0, 1), (-1, 1), 10),
+            ("TOPPADDING", (0, 1), (-1, 1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 0),
+        ]))
+        story.append(tabela_kpi)
+        story.append(Spacer(1, 8 * mm))
 
     for item in paragrafos:
         if item == "":
@@ -863,17 +1001,35 @@ def gerar_pdf_relatorio(titulo: str, subtitulo: str, paragrafos: list, figuras: 
         # "&" ou "<" cru dentro de uma descrição de tarefa, por exemplo,
         # quebraria a geração do PDF em vez de aparecer como texto.
         texto_seguro = str(texto).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        story.append(Paragraph(texto_seguro, styles[nome_estilo]))
+        story.append(Paragraph(texto_seguro, estilos.get(nome_estilo, estilos["Normal"])))
+
+    for legenda, cabecalhos, linhas in tabelas:
+        story.append(Spacer(1, 6 * mm))
+        story.append(Paragraph(legenda, estilos["Heading3"]))
+        story.append(Spacer(1, 2 * mm))
+        tabela = Table([cabecalhos] + linhas, hAlign="LEFT", repeatRows=1)
+        tabela.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), cor_primaria),
+            ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.white, cor_fundo_claro]),
+            ("GRID", (0, 0), (-1, -1), 0.5, rl_colors.HexColor("#E2E2E2")),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        story.append(tabela)
 
     for legenda, fig in figuras:
         story.append(Spacer(1, 8 * mm))
-        story.append(Paragraph(legenda, styles["Heading3"]))
+        story.append(Paragraph(legenda, estilos["Heading3"]))
         story.append(Spacer(1, 2 * mm))
         png_bytes = _mpl_fig_para_png_bytes(fig)
         altura_proporcional = largura_util * 0.55
         story.append(RLImage(io.BytesIO(png_bytes), width=largura_util, height=altura_proporcional))
 
-    doc.build(story)
+    doc.build(story, onFirstPage=_cabecalho_rodape, onLaterPages=_cabecalho_rodape)
     buffer.seek(0)
     return buffer.getvalue()
 
@@ -2846,6 +3002,17 @@ if is_admin:
             with c_down_pdf:
                 if st.button("📄 Gerar PDF da Daily", use_container_width=True, disabled=pending_changes):
                     with st.spinner("Montando o PDF..."):
+                        df_daily_combo = pd.concat([
+                            rep["df_ontem"].assign(Período=f"Ontem ({rep['d_ontem'].strftime('%d/%m')})"),
+                            rep["df_hoje"].assign(Período=f"Hoje ({rep['d_hoje'].strftime('%d/%m')})"),
+                        ], ignore_index=True) if not (rep["df_ontem"].empty and rep["df_hoje"].empty) else pd.DataFrame()
+
+                        kpis_pdf = [
+                            (f"{rep['df_ontem']['effort_hours'].sum():.1f}h", f"Ontem ({rep['d_ontem'].strftime('%d/%m')})"),
+                            (f"{rep['df_hoje']['effort_hours'].sum():.1f}h", f"Hoje ({rep['d_hoje'].strftime('%d/%m')})"),
+                            (f"{len(rep['df_ontem']) + len(rep['df_hoje'])}", "Registros"),
+                        ]
+
                         paragrafos_pdf = [
                             (f"O que fiz ontem ({rep['d_ontem'].strftime('%d/%m/%Y')}):", "Heading4"),
                         ]
@@ -2869,26 +3036,26 @@ if is_admin:
                         paragrafos_pdf.append(rep['duvidas'] or "Nenhuma.")
 
                         # O PORQUE: gráfico "respectivo" pedido -- mostra as horas
-                        # do próprio período da Daily (ontem + hoje) por projeto,
-                        # reaproveitando os mesmos dados já calculados pro resumo em
-                        # texto, sem precisar consultar o banco de novo.
+                        # do próprio período da Daily (ontem + hoje) por projeto e
+                        # por categoria, reaproveitando os mesmos dados já
+                        # calculados pro resumo em texto, sem precisar consultar o
+                        # banco de novo.
                         figuras_pdf = []
-                        df_daily_combo = pd.concat([
-                            rep["df_ontem"].assign(Período=f"Ontem ({rep['d_ontem'].strftime('%d/%m')})"),
-                            rep["df_hoje"].assign(Período=f"Hoje ({rep['d_hoje'].strftime('%d/%m')})"),
-                        ], ignore_index=True) if not (rep["df_ontem"].empty and rep["df_hoje"].empty) else pd.DataFrame()
-
                         if not df_daily_combo.empty:
-                            fig_daily_pdf = _grafico_barras_mpl(
+                            figuras_pdf.append(("Horas por Projeto (Ontem x Hoje)", _grafico_barras_mpl(
                                 df_daily_combo, "project", "effort_hours",
                                 "Horas por Projeto (Ontem x Hoje)", "Projeto", "Horas",
                                 cor_col="Período",
-                            )
-                            figuras_pdf.append(("Horas por Projeto (Ontem x Hoje)", fig_daily_pdf))
+                            )))
+                            if "category" in df_daily_combo.columns and df_daily_combo["category"].nunique() > 1:
+                                figuras_pdf.append(("Horas por Categoria", _grafico_pizza_mpl(
+                                    df_daily_combo, "category", "effort_hours", "Horas por Categoria (Ontem + Hoje)",
+                                )))
 
                         pdf_bytes = gerar_pdf_relatorio(
                             titulo="Resumo para a Daily",
                             subtitulo=f"Gerado em {datetime.today().strftime('%d/%m/%Y %H:%M')}",
+                            kpis=kpis_pdf,
                             paragrafos=paragrafos_pdf,
                             figuras=figuras_pdf,
                         )
@@ -3356,12 +3523,14 @@ with tab_dashboard:
                         # em gerar_pdf_relatorio().
                         if st.button("📄 Gerar PDF do Dashboard", use_container_width=True):
                             with st.spinner("Montando o PDF (isso pode levar alguns segundos)..."):
-                                paragrafos_pdf = [
-                                    f"Total de Registros: {len(df_filtered)}",
-                                    f"Total de Horas: {df_filtered['effort_hours'].sum():.2f}h",
-                                    f"Média de Horas/Dia (dias com registro): {media_horas_dia:.2f}h",
-                                    f"% Impedimentos: {pct_impedimento:.0f}%  |  % Dúvidas: {pct_duvida:.0f}%",
+                                kpis_pdf = [
+                                    (f"{len(df_filtered)}", "Registros"),
+                                    (f"{df_filtered['effort_hours'].sum():.1f}h", "Total de Horas"),
+                                    (f"{media_horas_dia:.1f}h", "Média/Dia"),
+                                    (f"{pct_impedimento:.0f}%", "Impedimentos"),
+                                    (f"{pct_duvida:.0f}%", "Dúvidas"),
                                 ]
+
                                 figuras_pdf = [
                                     ("Horas por Projeto", _grafico_barras_mpl(
                                         df_filtered, "project", "effort_hours", "Horas por Projeto", "Projeto", "Horas",
@@ -3375,10 +3544,35 @@ with tab_dashboard:
                                     figuras_pdf.append(("Horas por Data", _grafico_barras_mpl(
                                         df_por_data, "Data_PTBR", "effort_hours", "Horas por Data", "Data", "Horas",
                                     )))
+                                # O PORQUE: gráfico novo -- nenhuma versão anterior do
+                                # PDF mostrava a evolução de impedimentos/dúvidas, só o
+                                # total (via % nos KPIs). Só entra se houver pelo menos
+                                # um registro marcado, pra não desperdiçar uma página com
+                                # um gráfico vazio.
+                                if df_filtered[["is_impedimento", "is_duvida"]].astype(int).sum().sum() > 0:
+                                    figuras_pdf.append(("Impedimentos e Dúvidas", _grafico_impedimentos_mpl(
+                                        df_filtered, "Data_PTBR",
+                                    )))
+
+                                # O PORQUE: tabela com números exatos por projeto,
+                                # complementando o gráfico de barras (bom pra ver
+                                # proporção, ruim pra ler um valor preciso).
+                                total_horas_pdf = df_filtered["effort_hours"].sum()
+                                df_resumo_projeto = (
+                                    df_filtered.groupby("project")["effort_hours"].sum()
+                                    .sort_values(ascending=False).reset_index()
+                                )
+                                linhas_tabela_projeto = [
+                                    [r["project"], f"{r['effort_hours']:.2f}h", f"{(r['effort_hours'] / total_horas_pdf * 100 if total_horas_pdf else 0):.0f}%"]
+                                    for _, r in df_resumo_projeto.iterrows()
+                                ]
+                                tabelas_pdf = [("Resumo por Projeto", ["Projeto", "Horas", "% do Total"], linhas_tabela_projeto)]
+
                                 pdf_bytes = gerar_pdf_relatorio(
                                     titulo="Relatório do Dashboard",
                                     subtitulo=f"Período: {start_date.strftime('%d/%m/%Y')} a {end_date.strftime('%d/%m/%Y')}",
-                                    paragrafos=paragrafos_pdf,
+                                    kpis=kpis_pdf,
+                                    tabelas=tabelas_pdf,
                                     figuras=figuras_pdf,
                                 )
                             st.download_button(
