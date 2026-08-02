@@ -1,55 +1,44 @@
 <#
-    reorganizar_estrutura.ps1
+    reorganizar_estrutura.ps1 (v2 -- atualizado com os arquivos criados
+    desde a primeira versao deste script, que nunca chegou a ser rodada)
 
     O PORQUE: reorganiza a raiz do PersonalTrackerApp em docs/ e scripts/,
-    usando "git mv" (preserva o histórico de cada arquivo no Git) sempre que
-    o arquivo já estiver rastreado, e um Move-Item comum para o que não
-    estiver (ex.: v2_online/, os .zip). Roda em modo seguro por padrão --
-    só MOSTRA o que faria; use -Aplicar pra executar de verdade.
+    usando "git mv" (preserva o historico de cada arquivo no Git) sempre que
+    o arquivo ja estiver rastreado, e um Move-Item comum para o que nao
+    estiver. Roda em modo seguro por padrao -- so MOSTRA o que faria; use
+    -Aplicar pra executar de verdade.
+
+    NAO TOCA em: .ignore/ (controle pessoal seu), __pycache__/, venv/,
+    venv_linux/, .streamlit/secrets.toml, personal_tracker.db,
+    raw_history.txt -- ficam exatamente onde estao.
 
     Uso:
-        # 1) Rode sem parâmetros primeiro, pra revisar o que vai acontecer:
+        # 1) Rode sem parametros primeiro, pra revisar o que vai acontecer:
         .\reorganizar_estrutura.ps1
 
         # 2) Se estiver tudo certo, rode de novo com -Aplicar:
         .\reorganizar_estrutura.ps1 -Aplicar
 
-    Rode a partir da RAIZ do projeto (onde está o app.py).
+    Rode a partir da RAIZ do projeto (onde esta o app.py).
 #>
 
 param(
     [switch]$Aplicar
 )
 
-# O PORQUE: sem isso, acentos (ex.: "documentação") aparecem corrompidos no
-# console como "documentaÃ§Ã£o" -- é só a codificação de saída do terminal,
-# não afeta em nada os arquivos movidos/criados.
+# O PORQUE: sem isso, acentos aparecem corrompidos no console -- so
+# cosmetico, nao afeta os arquivos movidos/criados.
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 $ErrorActionPreference = "Stop"
-
-# O PORQUE: no PowerShell 7.3+, por padrão, um comando externo (nativo) que
-# escreve em stderr E sai com código != 0 é promovido a um erro FATAL,
-# respeitando $ErrorActionPreference -- mesmo quando esse "erro" é só o jeito
-# normal de um programa reportar uma condição esperada (como o
-# "git ls-files --error-unmatch" abaixo, que existe justamente pra
-# perguntar "esse arquivo está rastreado?" e responde "não" saindo com
-# código 1). Sem esta linha, isso derrubava o script inteiro na primeira
-# vez que encontrava um arquivo ainda não commitado. Aqui restauramos o
-# comportamento clássico: comandos externos nunca viram exceção sozinhos,
-# e continuamos checando $LASTEXITCODE manualmente (como já fazíamos).
 $PSNativeCommandUseErrorActionPreference = $false
 
 function Test-GitTracked {
     param([string]$Caminho)
-    # O PORQUE: "git ls-files --error-unmatch" (usado antes aqui) sai com
-    # código != 0 quando o arquivo NÃO está rastreado -- e isso, dependendo
-    # da versão/config do PowerShell, pode virar um erro fatal mesmo com
-    # $PSNativeCommandUseErrorActionPreference = $false (como você viu na
-    # prática). "git ls-files" SEM essa flag nunca sai com erro: só
-    # devolve o caminho (se rastreado) ou nada (se não estiver) -- e a
-    # gente decide com base no que voltou, sem depender de nenhum
-    # comportamento de tratamento de erro do PowerShell.
+    # O PORQUE: "git ls-files" SEM "--error-unmatch" nunca sai com erro --
+    # so devolve o caminho (se rastreado) ou nada (se nao estiver). Evita
+    # depender de tratamento de erro de comando externo, que se mostrou
+    # instavel entre versoes do PowerShell numa tentativa anterior.
     $resultado = git ls-files -- "$Caminho" 2>$null
     return [bool]$resultado
 }
@@ -60,7 +49,7 @@ function Mover-Item-Seguro {
         [string]$Destino
     )
     if (-not (Test-Path $Origem)) {
-        Write-Host "  (pular -- não existe) $Origem" -ForegroundColor DarkGray
+        Write-Host "  (pular -- nao existe) $Origem" -ForegroundColor DarkGray
         return
     }
 
@@ -72,10 +61,10 @@ function Mover-Item-Seguro {
             Write-Host "  git mv  $Origem  ->  $Destino" -ForegroundColor Green
         } else {
             Move-Item -Force -- $Origem $Destino
-            Write-Host "  move    $Origem  ->  $Destino  (não rastreado pelo git)" -ForegroundColor Yellow
+            Write-Host "  move    $Origem  ->  $Destino  (nao rastreado pelo git)" -ForegroundColor Yellow
         }
     } else {
-        $modo = if ($rastreado) { "git mv" } else { "move (não rastreado)" }
+        $modo = if ($rastreado) { "git mv" } else { "move (nao rastreado)" }
         Write-Host "  [SIMULACAO] $modo :: $Origem  ->  $Destino" -ForegroundColor Cyan
     }
 }
@@ -83,7 +72,7 @@ function Mover-Item-Seguro {
 function Remover-Item-Seguro {
     param([string]$Caminho)
     if (-not (Test-Path $Caminho)) {
-        Write-Host "  (pular -- não existe) $Caminho" -ForegroundColor DarkGray
+        Write-Host "  (pular -- nao existe) $Caminho" -ForegroundColor DarkGray
         return
     }
     if ($Aplicar) {
@@ -102,15 +91,18 @@ if ($Aplicar) {
     Write-Host "  [SIMULACAO] New-Item docs/, scripts/" -ForegroundColor Cyan
 }
 
-Write-Host "`n=== 2) Movendo documentação para docs/ ===" -ForegroundColor Magenta
+Write-Host "`n=== 2) Movendo documentacao para docs/ ===" -ForegroundColor Magenta
 Mover-Item-Seguro "Documentacao.md"              "docs/Documentacao.md"
 Mover-Item-Seguro "Documentacao_v2.md"           "docs/Documentacao_v2.md"
 Mover-Item-Seguro "TURSO_DEPLOY.md"              "docs/TURSO_DEPLOY.md"
-# O PORQUE: o nome no disco veio truncado/diferente do gerado
-# originalmente -- corrigindo pra CHANGELOG_SEGURANCA_E_UX.md no destino.
+# O PORQUE: nomes no disco vieram truncados/diferentes do gerado
+# originalmente -- corrigindo pro nome padrao no destino.
 Mover-Item-Seguro "changelog_seguranca_e_us.md"  "docs/CHANGELOG_SEGURANCA_E_UX.md"
+Mover-Item-Seguro "Guia_Convidado_Admin.md"      "docs/GUIA_CONVIDADO_ADMIN.md"
+Mover-Item-Seguro "GUIA_CONVIDADO_ADMIN.md"      "docs/GUIA_CONVIDADO_ADMIN.md"
+Mover-Item-Seguro "GUIA_IA_ESFORCO_E_SESSAO.md"  "docs/GUIA_IA_ESFORCO_E_SESSAO.md"
 
-Write-Host "`n=== 3) Movendo scripts utilitários para scripts/ ===" -ForegroundColor Magenta
+Write-Host "`n=== 3) Movendo scripts utilitarios para scripts/ ===" -ForegroundColor Magenta
 Mover-Item-Seguro "backfill_username.py"            "scripts/backfill_username.py"
 Mover-Item-Seguro "fix_legacy_descriptions.py"      "scripts/fix_legacy_descriptions.py"
 Mover-Item-Seguro "fix_project_reclassification.py" "scripts/fix_project_reclassification.py"
@@ -118,28 +110,28 @@ Mover-Item-Seguro "gerar_hash_de_senha.py"          "scripts/gerar_hash_de_senha
 Mover-Item-Seguro "import_history.py"               "scripts/import_history.py"
 Mover-Item-Seguro "migrate_to_turso.py"             "scripts/migrate_to_turso.py"
 
-Write-Host "`n=== 4) Removendo duplicatas e lixo (v2_online/, .zip) ===" -ForegroundColor Magenta
-Write-Host "  ATENÇÃO: confirme antes que não há nada único dentro de v2_online/" -ForegroundColor Yellow
+Write-Host "`n=== 4) Colocando o modelo de secrets junto do secrets.toml real ===" -ForegroundColor Magenta
+Mover-Item-Seguro "secrets.toml.example" ".streamlit/secrets.toml.example"
+
+Write-Host "`n=== 5) Removendo duplicatas e lixo (v2_online/, .zip) ===" -ForegroundColor Magenta
+Write-Host "  ATENCAO: confirme antes que nao ha nada unico dentro de v2_online/" -ForegroundColor Yellow
 Remover-Item-Seguro "v2_online"
 Remover-Item-Seguro "controle_de_atividades.zip"
 Remover-Item-Seguro "v2_online_zip.zip"
 
-Write-Host "`n=== 5) Verificando duplicidade de venv ===" -ForegroundColor Magenta
-if ((Test-Path "venv") -and (Test-Path "venv_linux")) {
-    Write-Host "  Encontrei venv/ E venv_linux/ juntos. Isso é esperado se você" -ForegroundColor Yellow
-    Write-Host "  desenvolve em Windows E Linux/WSL -- mantenha os dois, ambos" -ForegroundColor Yellow
-    Write-Host "  já cobertos pelo .gitignore novo. Se só usa um dos dois," -ForegroundColor Yellow
-    Write-Host "  apague manualmente o que sobrou (não removo automaticamente" -ForegroundColor Yellow
-    Write-Host "  por segurança)." -ForegroundColor Yellow
-}
+Write-Host "`n=== 6) O que fica onde esta (sem mudanca) ===" -ForegroundColor Magenta
+Write-Host "  app.py, database_core.py, importer_core.py, requirements.txt," -ForegroundColor DarkGray
+Write-Host "  README.md, n8n_workflow_estimativa_ia.json, .gitignore -- ficam na raiz." -ForegroundColor DarkGray
+Write-Host "  .ignore/, __pycache__/, venv/, venv_linux/, personal_tracker.db," -ForegroundColor DarkGray
+Write-Host "  raw_history.txt, .streamlit/secrets.toml -- ficam exatamente onde estao." -ForegroundColor DarkGray
 
-Write-Host "`n=== 6) Status final do git ===" -ForegroundColor Magenta
+Write-Host "`n=== 7) Status final do git ===" -ForegroundColor Magenta
 if ($Aplicar) {
     git status
 } else {
     Write-Host "  (rode novamente com -Aplicar para executar de verdade)" -ForegroundColor Cyan
 }
 
-Write-Host "`nConcluído. Revise 'git status' e, se estiver tudo certo:" -ForegroundColor Magenta
+Write-Host "`nConcluido. Revise 'git status' e, se estiver tudo certo:" -ForegroundColor Magenta
 Write-Host '  git add -A'
 Write-Host '  git commit -m "Reorganiza estrutura: docs/, scripts/, remove duplicatas"'

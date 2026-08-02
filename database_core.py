@@ -2,6 +2,7 @@ import os
 import sqlite3
 import pandas as pd
 import sys
+from datetime import datetime, timedelta
 
 # O PORQUE: Definição de credenciais via variáveis de ambiente.
 # No Streamlit Cloud, estas serão lidas das 'Secrets'. No Windows local,
@@ -125,7 +126,10 @@ class LogRepository:
         # administrativa. access_token só é preenchido quando aprovado (é o
         # que vira o link de acesso -- ?g=<token> -- que o admin copia e
         # manda pra pessoa). status controla quem pode entrar: só
-        # 'approved' com token válido consegue.
+        # 'approved' com token válido consegue. expires_at é opcional
+        # (NULL = sem prazo, até o admin revogar manualmente) -- o admin
+        # escolhe/ajusta esse prazo a qualquer momento pela área
+        # administrativa.
         query_access_requests = """
         CREATE TABLE IF NOT EXISTS access_requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -135,10 +139,12 @@ class LogRepository:
             status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'approved', 'rejected')),
             access_token TEXT,
             requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            decided_at TIMESTAMP
+            decided_at TIMESTAMP,
+            expires_at TIMESTAMP
         );
         """
         self.conn.execute(query_access_requests)
+        self._ensure_column("access_requests", "expires_at", "TIMESTAMP")
         self.conn.commit()
 
     def _ensure_column(self, table: str, column: str, column_def: str):
@@ -318,7 +324,7 @@ class LogRepository:
     # SOLICITAÇÕES DE ACESSO DE CONVIDADO
     # ==========================================
     ACCESS_REQUESTS_COLUMNS = [
-        "id", "name", "email", "justification", "status", "access_token", "requested_at", "decided_at",
+        "id", "name", "email", "justification", "status", "access_token", "requested_at", "decided_at", "expires_at",
     ]
 
     def count_active_access_requests(self) -> int:
@@ -359,18 +365,35 @@ class LogRepository:
             columns = self.ACCESS_REQUESTS_COLUMNS
         return pd.DataFrame(rows, columns=columns)
 
-    def approve_access_request(self, request_id: int) -> str:
+    def approve_access_request(self, request_id: int, dias_validade: int = 0) -> str:
         # O PORQUE: gera o token só na hora da aprovação (não antes) -- um
         # pedido pendente não tem nenhum link válido ainda, então não tem
         # como "vazar" acesso de algo que nunca foi aprovado.
+        # dias_validade: 0 (ou negativo) = sem expiração (até revogar
+        # manualmente); um número positivo define daqui a quantos dias o
+        # link para de funcionar sozinho.
         import secrets as _secrets
         token = _secrets.token_urlsafe(24)
+        expires_at = (datetime.now() + timedelta(days=dias_validade)).isoformat() if dias_validade > 0 else None
         self.conn.execute(
-            "UPDATE access_requests SET status = 'approved', access_token = ?, decided_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (token, request_id),
+            "UPDATE access_requests SET status = 'approved', access_token = ?, decided_at = CURRENT_TIMESTAMP, expires_at = ? WHERE id = ?",
+            (token, expires_at, request_id),
         )
         self.conn.commit()
         return token
+
+    def update_access_request_expiry(self, request_id: int, dias_validade: int = 0):
+        # O PORQUE: permite ajustar a validade de um acesso JÁ aprovado, a
+        # qualquer momento -- sem precisar revogar e aprovar de novo (o que
+        # trocaria o token, invalidando um link já compartilhado).
+        # dias_validade: 0 (ou negativo) = remove a expiração (passa a
+        # valer até ser revogado manualmente).
+        expires_at = (datetime.now() + timedelta(days=dias_validade)).isoformat() if dias_validade > 0 else None
+        self.conn.execute(
+            "UPDATE access_requests SET expires_at = ? WHERE id = ?",
+            (expires_at, request_id),
+        )
+        self.conn.commit()
 
     def reject_access_request(self, request_id: int):
         # O PORQUE: também serve para REVOGAR um acesso já aprovado -- muda
@@ -390,12 +413,25 @@ class LogRepository:
         # O PORQUE: checagem ao vivo no banco (não um token autoverificável
         # tipo o de sessão do admin) -- é isso que permite revogar o acesso
         # de um convidado instantaneamente (rejeitar/excluir o pedido), sem
-        # depender de expiração por tempo nem de lista de tokens revogados
-        # em memória.
+        # depender de lista de tokens revogados em memória. A expiração por
+        # tempo (quando definida) é checada aqui também, em Python -- mais
+        # simples e mais confiável entre SQLite/Turso do que comparar
+        # timestamps direto no SQL.
         row = self.conn.execute(
-            "SELECT id, name, email, status FROM access_requests WHERE access_token = ? AND status = 'approved'",
+            "SELECT id, name, email, status, expires_at FROM access_requests WHERE access_token = ? AND status = 'approved'",
             (token,),
         ).fetchone()
         if not row:
             return None
+        expires_at_str = row[4]
+        if expires_at_str:
+            try:
+                if datetime.fromisoformat(str(expires_at_str)) < datetime.now():
+                    return None
+            except Exception:
+                # O PORQUE: um valor de data mal formado não deve travar o
+                # acesso de quem já estava aprovado -- trata como "sem
+                # expiração" nesse caso raro, em vez de derrubar o convidado
+                # por um dado corrompido.
+                pass
         return {"id": row[0], "name": row[1], "email": row[2], "status": row[3]}

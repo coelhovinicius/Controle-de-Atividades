@@ -1190,15 +1190,48 @@ def render_admin_solicitacoes():
                         "Copie e adicione ao final da URL do seu app (ex.: "
                         "`https://seu-app.streamlit.app/?g=...`) e mande para o convidado."
                     )
+                    # O PORQUE: mostra a validade atual em linguagem simples --
+                    # "sem expiração" (expires_at vazio) ou a data/hora exata em
+                    # que o link vai parar de funcionar sozinho.
+                    expira_em = row.get("expires_at")
+                    if expira_em:
+                        try:
+                            expira_fmt = datetime.fromisoformat(str(expira_em)).strftime("%d/%m/%Y às %H:%M")
+                            if datetime.fromisoformat(str(expira_em)) < datetime.now():
+                                st.caption(f"⏳ Expirou em {expira_fmt} (o link já não funciona mais, mesmo sem revogar).")
+                            else:
+                                st.caption(f"⏳ Expira em {expira_fmt}.")
+                        except Exception:
+                            st.caption("⏳ Validade configurada, mas não foi possível ler a data.")
+                    else:
+                        st.caption("⏳ Sem expiração definida (vale até você revogar).")
             with c_acoes:
                 if row["status"] == "pending":
+                    # O PORQUE: escolhe a validade ANTES de aprovar -- 0 dias
+                    # significa "sem expiração", à sua escolha, ajustável depois
+                    # a qualquer momento (ver bloco "approved" abaixo).
+                    dias_novo = st.number_input(
+                        "Validade (dias)", min_value=0, value=7, step=1, key=f"dias_aprovar_{request_id}",
+                        help="0 = sem expiração (vale até você revogar manualmente).",
+                    )
                     if st.button("✅ Aprovar", key=f"aprovar_{request_id}", use_container_width=True):
-                        repo.approve_access_request(request_id)
+                        repo.approve_access_request(request_id, int(dias_novo))
                         st.rerun()
                     if st.button("❌ Rejeitar", key=f"rejeitar_{request_id}", use_container_width=True):
                         repo.reject_access_request(request_id)
                         st.rerun()
                 elif row["status"] == "approved":
+                    # O PORQUE: ajustar a validade de um acesso JÁ aprovado sem
+                    # precisar revogar e aprovar de novo (o que trocaria o
+                    # token, invalidando um link que talvez já tenha sido
+                    # compartilhado com a pessoa).
+                    dias_ajuste = st.number_input(
+                        "Nova validade (dias)", min_value=0, value=0, step=1, key=f"dias_ajustar_{request_id}",
+                        help="A partir de agora. 0 = remove a expiração (passa a valer até você revogar).",
+                    )
+                    if st.button("🔄 Atualizar validade", key=f"atualizar_validade_{request_id}", use_container_width=True):
+                        repo.update_access_request_expiry(request_id, int(dias_ajuste))
+                        st.rerun()
                     if st.button("🚫 Revogar", key=f"revogar_{request_id}", use_container_width=True):
                         _dialog_confirmar_revogar_acesso(request_id, row["name"])
                 if st.button("🗑️ Excluir", key=f"excluir_{request_id}", use_container_width=True):
