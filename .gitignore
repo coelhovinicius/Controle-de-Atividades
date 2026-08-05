@@ -43,3 +43,9 @@ secrets.txt
 
 # Pasta de arquivos a serem ignorados
 .ignore/
+
+# Chave pública do banco de emergência (gerada localmente por
+# scripts/gerar_chaves_fallback.py) -- não é segredo (é a metade pública),
+# mas é um artefato gerado, não código-fonte. Se precisar recriar, é só
+# rodar o script de novo.
+jwt_public.pem
