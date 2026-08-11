@@ -773,18 +773,27 @@ def build_color_map(base_map: dict, values) -> dict:
 # em telas estreitas), margens enxutas, e rótulos do eixo X inclinados
 # quando há muitas categorias (evita sobreposição de texto).
 def apply_responsive_layout(fig, rotate_xaxis: bool = False):
+    # O PORQUE: quando os rótulos do eixo X giram (rotate_xaxis=True, usado
+    # quando há muitas categorias/nomes longos), eles descem bem mais que
+    # rótulos na horizontal -- com a legenda numa posição fixa de sempre,
+    # os dois brigavam de espaço (foi exatamente o que aconteceu: o texto
+    # da legenda sobrepondo o rótulo/título do eixo). Com rótulos girados,
+    # empurra a legenda mais pra baixo e reserva mais margem embaixo pra
+    # caber os dois sem se tocar.
+    y_legenda = -0.55 if rotate_xaxis else -0.25
+    margem_inferior = 120 if rotate_xaxis else 10
     fig.update_layout(
         font=dict(size=12),
         title_font=dict(size=15),
         legend=dict(
             orientation="h",
             yanchor="top",
-            y=-0.25,
+            y=y_legenda,
             xanchor="center",
             x=0.5,
             font=dict(size=11),
         ),
-        margin=dict(l=10, r=10, t=50, b=10),
+        margin=dict(l=10, r=10, t=50, b=margem_inferior),
     )
     if rotate_xaxis:
         fig.update_xaxes(tickangle=-45, tickfont=dict(size=10))
@@ -1149,11 +1158,34 @@ def gerar_pdf_relatorio(titulo: str, subtitulo: str, paragrafos: list = None, fi
 
     for legenda, fig in figuras:
         story.append(Spacer(1, 8 * mm))
-        story.append(Paragraph(legenda, estilos["Heading3"]))
-        story.append(Spacer(1, 2 * mm))
+        # O PORQUE: removido o título em Paragraph que ficava aqui em cima
+        # (repetia o mesmo texto que o próprio matplotlib já desenha DENTRO
+        # da imagem, via ax.set_title() -- redundante) -- além de duplicado,
+        # causava um problema pior: texto e imagem eram dois elementos
+        # separados, então o reportlab podia colocar o título sozinho no
+        # fim de uma página e só o gráfico na página seguinte, deixando um
+        # título "órfão" com um vão vazio embaixo. Sem o título solto, sobra
+        # só a imagem (que já é auto-suficiente) -- se não couber no
+        # espaço restante da página, ela inteira passa pra próxima, sem
+        # deixar nada pra trás.
+        largura_pol, altura_pol = fig.get_size_inches()
+        razao_altura_largura = altura_pol / largura_pol
         png_bytes = _mpl_fig_para_png_bytes(fig)
-        altura_proporcional = largura_util * 0.55
-        story.append(RLImage(io.BytesIO(png_bytes), width=largura_util, height=altura_proporcional))
+
+        altura_maxima = 100 * mm
+        largura_final = largura_util
+        altura_final = largura_final * razao_altura_largura
+        if altura_final > altura_maxima:
+            altura_final = altura_maxima
+            largura_final = altura_final / razao_altura_largura
+
+        imagem = RLImage(io.BytesIO(png_bytes), width=largura_final, height=altura_final)
+        # O PORQUE: quando o gráfico fica mais estreito que a página (caso
+        # da pizza, depois de limitada pela altura máxima), centraliza em
+        # vez de deixar "grudado" na margem esquerda com espaço vazio sobrando
+        # à direita.
+        imagem.hAlign = "CENTER"
+        story.append(imagem)
 
     doc.build(story, onFirstPage=_cabecalho_rodape, onLaterPages=_cabecalho_rodape)
     buffer.seek(0)
