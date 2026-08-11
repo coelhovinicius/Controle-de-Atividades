@@ -367,9 +367,33 @@ def _tela_login():
 
         st.subheader("Acesso restrito")
         with st.form("login_form"):
-            username = st.text_input("Usuário")
+            username = st.text_input("Usuário", key="login_username_field")
             password = st.text_input("Senha", type="password")
             entrar = st.form_submit_button("Entrar", type="primary", use_container_width=True)
+
+        # O PORQUE: Streamlit não tem um parâmetro nativo de "autofocus" pra
+        # widgets -- precisa de um empurrãozinho via JS. Procura pelo
+        # aria-label do campo (mais confiável que "primeiro input da
+        # página", que quebraria se algum dia um campo de busca/outro form
+        # aparecer antes deste na tela). O try/catch de window.top vs
+        # window.parent é o mesmo padrão já usado no cookie de sessão --
+        # o componente roda num iframe, então precisa "escapar" pra alcançar
+        # o campo de verdade na página.
+        st.components.v1.html(
+            """
+            <script>
+            function focarCampoUsuario(doc) {
+                const campo = doc.querySelector('input[aria-label="Usuário"]');
+                if (campo) { campo.focus(); }
+            }
+            setTimeout(function() {
+                try { focarCampoUsuario(window.top.document); }
+                catch (e) { focarCampoUsuario(window.parent.document); }
+            }, 150);
+            </script>
+            """,
+            height=0,
+        )
 
         if entrar:
             with st.spinner("Verificando credenciais..."):
@@ -767,6 +791,70 @@ def apply_responsive_layout(fig, rotate_xaxis: bool = False):
     return fig
 
 
+def renderizar_toggle_colunas_grafico(escopo: str):
+    """
+    Desenha o toggle "flutuante" (sticky) uma única vez por aba/tela, pra
+    escolher entre 1 ou 2 gráficos lado a lado. Chame isso UMA vez, no topo
+    da seção de gráficos -- os pares de coluna individuais de cada gráfico
+    devem usar obter_par_colunas_grafico() (que só LÊ o valor, sem desenhar
+    outro widget -- widgets repetidos com a mesma chave dão erro no
+    Streamlit).
+    """
+    chave = f"chart_cols_{escopo}"
+    if chave not in st.session_state:
+        st.session_state[chave] = 2
+
+    container_key = f"toggle_graficos_{escopo}"
+    st.markdown(
+        f"""
+        <style>
+        .st-key-{container_key} {{
+            position: sticky;
+            top: 0.4rem;
+            z-index: 999;
+            display: inline-block;
+            background: rgba(120, 120, 120, 0.18);
+            backdrop-filter: blur(4px);
+            padding: 2px 10px;
+            border-radius: 999px;
+            margin-bottom: 8px;
+        }}
+        .st-key-{container_key} [data-testid="stRadio"] > label {{
+            display: none;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.container(key=container_key):
+        escolha = st.radio(
+            "Gráficos por linha",
+            ["1 gráfico por linha", "2 gráficos por linha"],
+            index=(0 if st.session_state[chave] == 1 else 1),
+            horizontal=True,
+            key=f"{chave}_radio",
+            label_visibility="collapsed",
+        )
+        st.session_state[chave] = 1 if escolha.startswith("1") else 2
+
+
+def obter_par_colunas_grafico(escopo: str):
+    """
+    Só LÊ a preferência já escolhida em renderizar_toggle_colunas_grafico()
+    (chamada antes, uma vez só) e devolve duas referências de coluna prontas
+    pra usar em "with col_a:"/"with col_b:" já existentes:
+      - 2 por linha: col_a e col_b são colunas DIFERENTES (lado a lado).
+      - 1 por linha: col_a e col_b são o MESMO container -- os dois "with"
+        escrevem um embaixo do outro, sem precisar reescrever nenhum
+        gráfico já pronto.
+    """
+    cols_por_linha = st.session_state.get(f"chart_cols_{escopo}", 2)
+    if cols_por_linha == 2:
+        return st.columns(2)
+    container_unico = st.container()
+    return container_unico, container_unico
+
+
 # O PORQUE: paleta única, usada tanto nos gráficos (matplotlib) quanto nas
 # tabelas/cabeçalho (reportlab) dos PDFs -- dá uma identidade visual
 # consistente ao relatório, em vez de cada gráfico sair com as cores
@@ -990,6 +1078,62 @@ def gerar_pdf_relatorio(titulo: str, subtitulo: str, paragrafos: list = None, fi
         story.append(tabela_kpi)
         story.append(Spacer(1, 8 * mm))
 
+    # O PORQUE: tabelas ANTES de parágrafos de propósito -- no PDF da Daily,
+    # as tabelas de atividades (O que fiz ontem/O que farei hoje) precisam
+    # aparecer antes do texto de Impedimentos/Dúvidas. O PDF do Dashboard
+    # não usa "paragrafos" (só kpis/tabelas/figuras), então essa ordem não
+    # muda nada por lá.
+    for item_tabela in tabelas:
+        # O PORQUE: aceita tanto (legenda, cabecalhos, linhas) quanto
+        # (legenda, cabecalhos, linhas, larguras) -- o 4º elemento é
+        # opcional, só usado quando uma coluna precisa de largura
+        # proporcional específica (ex.: "Descrição" bem mais larga que
+        # "Horas"). Sem ele, divide a largura da página igualmente entre as
+        # colunas -- ok pra tabelas com conteúdo curto (ex.: "Resumo por
+        # Projeto"), mas seria estreito demais pra uma coluna de texto
+        # longo, daí o suporte às larguras explícitas.
+        if len(item_tabela) == 4:
+            legenda, cabecalhos, linhas, larguras = item_tabela
+        else:
+            legenda, cabecalhos, linhas = item_tabela
+            larguras = [largura_util / len(cabecalhos)] * len(cabecalhos)
+
+        story.append(Spacer(1, 6 * mm))
+        story.append(Paragraph(legenda, estilos["Heading3"]))
+        story.append(Spacer(1, 2 * mm))
+
+        def _celula_segura(texto, estilo):
+            # O PORQUE: célula vira Paragraph (não string crua) -- é o que
+            # permite o texto QUEBRAR LINHA dentro da largura da coluna, em
+            # vez de forçar a coluna a alargar até caber numa linha só
+            # (isso é o que causava o PDF "cortado": uma coluna de
+            # descrição longa empurrando a tabela pra fora da página). Mesmo
+            # escape de sempre, já que Paragraph interpreta <, > e & como
+            # marcação.
+            texto_seguro = str(texto).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            return Paragraph(texto_seguro, estilo)
+
+        estilo_cabecalho = ParagraphStyle(
+            "CabecalhoTabela", parent=estilos["Normal"], textColor=rl_colors.white,
+            fontName="Helvetica-Bold", fontSize=9,
+        )
+        estilo_celula = ParagraphStyle("CelulaTabela", parent=estilos["Normal"], fontSize=9, leading=11)
+
+        linha_cabecalho = [_celula_segura(c, estilo_cabecalho) for c in cabecalhos]
+        linhas_dados = [[_celula_segura(c, estilo_celula) for c in linha] for linha in linhas]
+
+        tabela = Table([linha_cabecalho] + linhas_dados, colWidths=larguras, hAlign="LEFT", repeatRows=1)
+        tabela.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), cor_primaria),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.white, cor_fundo_claro]),
+            ("GRID", (0, 0), (-1, -1), 0.5, rl_colors.HexColor("#E2E2E2")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        story.append(tabela)
+
     for item in paragrafos:
         if item == "":
             story.append(Spacer(1, 4 * mm))
@@ -1002,24 +1146,6 @@ def gerar_pdf_relatorio(titulo: str, subtitulo: str, paragrafos: list = None, fi
         # quebraria a geração do PDF em vez de aparecer como texto.
         texto_seguro = str(texto).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         story.append(Paragraph(texto_seguro, estilos.get(nome_estilo, estilos["Normal"])))
-
-    for legenda, cabecalhos, linhas in tabelas:
-        story.append(Spacer(1, 6 * mm))
-        story.append(Paragraph(legenda, estilos["Heading3"]))
-        story.append(Spacer(1, 2 * mm))
-        tabela = Table([cabecalhos] + linhas, hAlign="LEFT", repeatRows=1)
-        tabela.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), cor_primaria),
-            ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.white, cor_fundo_claro]),
-            ("GRID", (0, 0), (-1, -1), 0.5, rl_colors.HexColor("#E2E2E2")),
-            ("TOPPADDING", (0, 0), (-1, -1), 5),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-            ("LEFTPADDING", (0, 0), (-1, -1), 6),
-        ]))
-        story.append(tabela)
 
     for legenda, fig in figuras:
         story.append(Spacer(1, 8 * mm))
@@ -1477,10 +1603,10 @@ if 'sync_file_name' not in st.session_state:
     st.session_state.sync_file_name = "raw_history.txt"
 # O PORQUE: guarda qual coluna da tabela (ID, Data, Projeto ou Categoria) e em
 # qual direção (asc/desc) o usuário escolheu ordenar, clicando no cabeçalho.
-# Padrão: ID descendente (registro mais recente cadastrado primeiro) -- o
-# usuário pode clicar em qualquer cabeçalho pra mudar isso a qualquer momento.
+# Padrão: Data descendente (atividade mais recente primeiro) -- o usuário
+# pode clicar em qualquer cabeçalho pra mudar isso a qualquer momento.
 if 'sort_column' not in st.session_state:
-    st.session_state.sort_column = "id"
+    st.session_state.sort_column = "log_date"
 if 'sort_ascending' not in st.session_state:
     st.session_state.sort_ascending = False
 if 'daily_report' not in st.session_state:
@@ -2160,13 +2286,6 @@ def _manage_options_panel(label_singular: str, option_type: str, base_options: l
 
 with st.sidebar:
     is_admin = st.session_state.get("user_role") == "admin"
-    if is_admin:
-        st.caption(f"Logado como **{st.session_state.get('auth_username', '')}**")
-    else:
-        st.caption(f"👁️ Convidado (somente leitura): **{st.session_state.get('guest_name', '')}**")
-    if st.button("🚪 Sair", use_container_width=True):
-        _dialog_confirmar_logout()
-    st.markdown("---")
 
 if is_admin:
     with st.sidebar:
@@ -2265,6 +2384,19 @@ if is_admin:
             if qtd_pendentes:
                 st.caption(f"🔔 {qtd_pendentes} pendente(s)")
 
+# O PORQUE: "Logado como" + "Sair" ficam por último de propósito -- é o
+# fim natural do menu, junto de qualquer outra coisa que ainda venha a ser
+# adicionada na barra lateral no futuro (a intenção é que esse bloco sempre
+# feche o menu, não fique preso entre as seções).
+with st.sidebar:
+    st.markdown("---")
+    if is_admin:
+        st.caption(f"Logado como **{st.session_state.get('auth_username', '')}**")
+    else:
+        st.caption(f"👁️ Convidado (somente leitura): **{st.session_state.get('guest_name', '')}**")
+    if st.button("🚪 Sair", use_container_width=True):
+        _dialog_confirmar_logout()
+
 st.title("📊 Task Tracker")
 
 if is_admin and st.session_state.get("mostrar_admin_solicitacoes"):
@@ -2335,7 +2467,7 @@ with tab_manage:
 
         with st.form("grid_filter_form"):
             st.markdown("##### Período")
-            c_gstart, c_gend = st.columns(2)
+            c_gstart, c_gend, c_gbtn = st.columns([2, 2, 1])
             with c_gstart:
                 grid_start_input = st.date_input(
                     "Data Inicial",
@@ -2348,7 +2480,13 @@ with tab_manage:
                     value=st.session_state.get("grid_end_date", hoje_grid),
                     format="DD/MM/YYYY",
                 )
-            grid_apply = st.form_submit_button("Aplicar Filtro", type="primary")
+            with c_gbtn:
+                # O PORQUE: st.date_input desenha um rótulo em cima do campo;
+                # sem esse espaço em branco do mesmo tamanho, o botão fica
+                # alinhado mais alto que os campos de data, em vez de na
+                # mesma linha visual.
+                st.markdown("<div style='height: 1.8rem'></div>", unsafe_allow_html=True)
+                grid_apply = st.form_submit_button("Aplicar Filtro", type="primary", use_container_width=True)
 
         if grid_apply:
             if grid_start_input > grid_end_input:
@@ -2412,31 +2550,16 @@ with tab_manage:
             if total_records == 0:
                 st.warning("Nenhum registro encontrado para essa busca.")
             else:
-                col_per_page, col_page_jump, _ = st.columns([1, 1, 4])
-                with col_per_page:
-                    items_per_page = st.selectbox("Registros por página", [10, 25, 50, 100], index=1)
-
+                # O PORQUE: só calcula aqui (não desenha os controles ainda) --
+                # os widgets de paginação em si (seletor de itens por página,
+                # ir pra página, Anterior/Próximo) ficam DEPOIS da tabela, no
+                # rodapé da lista. items_per_page vem do valor já aplicado
+                # (session_state), lido ANTES de desenhar o widget -- que só
+                # aparece mais abaixo, depois da tabela.
+                items_per_page = st.session_state.get("grid_items_per_page", 25)
                 total_pages = max(1, (total_records + items_per_page - 1) // items_per_page)
                 if st.session_state.current_page > total_pages:
                     st.session_state.current_page = total_pages
-
-                with col_page_jump:
-                    jump_page = st.number_input("Ir para a página", min_value=1, max_value=total_pages, value=st.session_state.current_page)
-                    if jump_page != st.session_state.current_page:
-                        st.session_state.current_page = jump_page
-                        st.rerun()
-
-                col_prev, col_info, col_next, _ = st.columns([1, 2, 1, 4])
-                with col_prev:
-                    if st.button("⬅️ Anterior", disabled=(st.session_state.current_page == 1), use_container_width=True):
-                        st.session_state.current_page -= 1
-                        st.rerun()
-                with col_info:
-                    st.markdown(f"<div style='text-align: center; padding-top: 5px; font-weight: bold;'>Página {st.session_state.current_page} de {total_pages} (Total: {total_records})</div>", unsafe_allow_html=True)
-                with col_next:
-                    if st.button("Próximo ➡️", disabled=(st.session_state.current_page == total_pages), use_container_width=True):
-                        st.session_state.current_page += 1
-                        st.rerun()
 
                 st.markdown("---")
                 with st.container(key="atividades_grid"):
@@ -2507,6 +2630,91 @@ with tab_manage:
                             else:
                                 st.write("")
                 st.markdown("---")
+
+                # O PORQUE: a tentativa anterior com CSS puro (:nth-of-type)
+                # não funcionou -- o Streamlit não organiza as linhas da grid
+                # como irmãs diretas de um mesmo pai, do jeito que o CSS
+                # "nth-of-type" precisa pra contar certo. JavaScript resolve
+                # isso de forma mais confiável: percorre TODOS os blocos de
+                # linha dentro do container (documento em ordem visual, de
+                # cima pra baixo, não importa a profundidade de aninhamento)
+                # e aplica a cor alternada manualmente -- índice 0 é o
+                # cabeçalho (sem sombra), os de índice ímpar (1ª, 3ª, 5ª...
+                # linha de dados) ganham o fundo. Roda de novo a cada rerun
+                # (troca de página, ordenação, novo registro etc.), já que
+                # este componente é redesenhado do zero em toda execução.
+                st.components.v1.html(
+                    """
+                    <script>
+                    function aplicarZebraGrid(doc) {
+                        const grid = doc.querySelector('.st-key-atividades_grid');
+                        if (!grid) return;
+                        const todosBlocos = Array.from(grid.querySelectorAll('[data-testid="stHorizontalBlock"]'));
+                        // O PORQUE: a coluna "Ações" tem um st.columns() ANINHADO
+                        // por dentro (pros botões ✏️/🗑️) -- sem este filtro, cada
+                        // linha visível contaria como 2 blocos (o de fora + o de
+                        // dentro), o que quebrava a alternância par/ímpar (toda
+                        // linha real caía sempre no mesmo grupo). Aqui, descarta
+                        // qualquer bloco que tenha OUTRO bloco de linha entre ele
+                        // e a grid -- sobra só os blocos de "linha de verdade".
+                        const linhas = todosBlocos.filter(function(bloco) {
+                            let pai = bloco.parentElement;
+                            while (pai && pai !== grid) {
+                                if (pai.matches && pai.matches('[data-testid="stHorizontalBlock"]')) {
+                                    return false;
+                                }
+                                pai = pai.parentElement;
+                            }
+                            return true;
+                        });
+                        linhas.forEach(function(linha, indice) {
+                            if (indice > 0 && indice % 2 === 1) {
+                                linha.style.backgroundColor = 'rgba(120, 120, 120, 0.12)';
+                                linha.style.borderRadius = '4px';
+                            } else {
+                                linha.style.backgroundColor = '';
+                            }
+                        });
+                    }
+                    setTimeout(function() {
+                        try { aplicarZebraGrid(window.top.document); }
+                        catch (e) { aplicarZebraGrid(window.parent.document); }
+                    }, 250);
+                    </script>
+                    """,
+                    height=0,
+                )
+
+                # O PORQUE: os 4 elementos pedidos (Registros por página, Ir
+                # para a página, Anterior, Próximo) numa linha só, depois da
+                # lista -- não mais antes dela. A legenda "Página X de Y"
+                # fica numa linha própria acima, já que não fazia parte do
+                # pedido de "mesma linha" dos 4 controles.
+                st.caption(f"Página {st.session_state.current_page} de {total_pages} (Total: {total_records} registros)")
+                col_per_page, col_page_jump, col_prev, col_next = st.columns([1.4, 1.4, 1, 1])
+                with col_per_page:
+                    opcoes_por_pagina = [10, 25, 50, 100]
+                    idx_atual = opcoes_por_pagina.index(items_per_page) if items_per_page in opcoes_por_pagina else 1
+                    novo_items_per_page = st.selectbox(
+                        "Registros por página", opcoes_por_pagina, index=idx_atual, key="grid_items_per_page",
+                    )
+                with col_page_jump:
+                    jump_page = st.number_input(
+                        "Ir para a página", min_value=1, max_value=total_pages, value=st.session_state.current_page,
+                    )
+                    if jump_page != st.session_state.current_page:
+                        st.session_state.current_page = jump_page
+                        st.rerun()
+                with col_prev:
+                    st.markdown("<div style='height: 1.8rem'></div>", unsafe_allow_html=True)
+                    if st.button("⬅️ Anterior", disabled=(st.session_state.current_page == 1), use_container_width=True):
+                        st.session_state.current_page -= 1
+                        st.rerun()
+                with col_next:
+                    st.markdown("<div style='height: 1.8rem'></div>", unsafe_allow_html=True)
+                    if st.button("Próximo ➡️", disabled=(st.session_state.current_page == total_pages), use_container_width=True):
+                        st.session_state.current_page += 1
+                        st.rerun()
 
     if st.session_state.view_state == 'add':
         st.header("Novo Registro")
@@ -2715,12 +2923,18 @@ if is_admin:
         # valor escolhido passa a valer para as sugestões e para o relatório.
         with st.form("daily_period_form"):
             st.markdown("### Escolha o Período")
-            col_d1, col_d2 = st.columns(2)
+            col_d1, col_d2, col_d3 = st.columns([2, 2, 1])
             with col_d1:
                 d_ontem_input = st.date_input("Data Anterior (Ontem)", value=default_ontem, format="DD/MM/YYYY", key="daily_d_ontem")
             with col_d2:
                 d_hoje_input = st.date_input("Data Atual (Hoje)", value=default_hoje, format="DD/MM/YYYY", key="daily_d_hoje")
-            apply_daily_period = st.form_submit_button("Aplicar Período", type="primary")
+            with col_d3:
+                # O PORQUE: mesmo truque de alinhamento vertical usado nos
+                # outros filtros de período -- compensa a altura do rótulo
+                # que st.date_input desenha acima do campo, senão o botão
+                # fica "mais alto" que os campos de data na mesma linha.
+                st.markdown("<div style='height: 1.8rem'></div>", unsafe_allow_html=True)
+                apply_daily_period = st.form_submit_button("Aplicar Período", type="primary", use_container_width=True)
 
         if apply_daily_period:
             st.session_state.daily_period_ontem = d_ontem_input
@@ -2736,24 +2950,16 @@ if is_admin:
 
         st.caption(f"Período aplicado: Ontem = {d_ontem.strftime('%d/%m/%Y')} • Hoje = {d_hoje.strftime('%d/%m/%Y')}")
 
-        # O PORQUE: Impedimentos/Dúvidas passam a ter uma sugestão automática,
-        # montada a partir dos registros do período acima que estiverem marcados
-        # com is_impedimento/is_duvida (via checkbox manual no formulário ou
-        # inferência automática na importação de arquivo). O botão é separado do
-        # "Processar Relatório" de propósito: assim você pode ajustar as datas,
-        # puxar a sugestão, editar à mão o que quiser, e só então gerar o resumo
-        # final -- sem perder o que já tinha digitado a cada rerun da tela.
         _daily_txt_editing_lock = st.session_state.get("daily_txt_editing", False)
         if _daily_txt_editing_lock:
             st.warning("✏️ Finalize (salve) a edição do texto corrido abaixo para liberar os outros botões desta aba.")
 
         def _merge_daily_suggestion(current_text: str, suggestion_text: str, empty_placeholder: str) -> str:
-            # O PORQUE: antes, "Atualizar sugestões da base de dados" SOBRESCREVIA
-            # por completo o que o usuário já tinha digitado à mão em
-            # Impedimentos/Dúvidas. Agora, cada linha já digitada manualmente é
-            # preservada, e só as linhas da sugestão automática que ainda não
-            # estão lá são adicionadas (sem duplicar). O placeholder padrão
-            # ("Nenhum."/"Nenhuma.") não conta como conteúdo real do usuário.
+            # O PORQUE: preserva cada linha já digitada à mão em
+            # Impedimentos/Dúvidas -- só adiciona as linhas da sugestão
+            # automática que ainda não estão lá (sem duplicar). O
+            # placeholder padrão ("Nenhum."/"Nenhuma.") não conta como
+            # conteúdo real do usuário.
             current_lines = [ln.strip() for ln in (current_text or "").strip().splitlines() if ln.strip()]
             current_lines = [ln for ln in current_lines if ln.lower() != empty_placeholder.lower()]
 
@@ -2767,7 +2973,16 @@ if is_admin:
 
             return "\n".join(combined) if combined else empty_placeholder
 
-        if st.button("🔄 Atualizar sugestões da base de dados", disabled=_daily_txt_editing_lock):
+        # O PORQUE: antes, era preciso clicar num segundo botão ("Atualizar
+        # sugestões da base de dados") depois de aplicar o período. Agora,
+        # aplicar o período já atualiza a sugestão de Impedimentos/Dúvidas
+        # sozinho -- só roda quando "Aplicar Período" foi de fato clicado
+        # NESTA execução (apply_daily_period), nunca em qualquer outro
+        # rerun, senão sobrescreveria uma edição manual sem motivo. Isso
+        # também precisa rodar ANTES dos widgets de texto corrido serem
+        # criados mais abaixo (mesma regra de sempre: não dá pra escrever
+        # em st.session_state[key] de um widget já instanciado neste run).
+        if apply_daily_period and not _daily_txt_editing_lock:
             df_all_suggestion = repo.get_all_logs_as_dataframe(_current_user())
             new_imp_suggestion = build_daily_suggestion(df_all_suggestion, d_ontem, d_hoje, "is_impedimento")
             new_duv_suggestion = build_daily_suggestion(df_all_suggestion, d_ontem, d_hoje, "is_duvida")
@@ -2777,21 +2992,26 @@ if is_admin:
             st.session_state["duvidas_input"] = _merge_daily_suggestion(
                 st.session_state.get("duvidas_input", ""), new_duv_suggestion, "Nenhuma."
             )
-            st.rerun()
 
         if "impedimentos_input" not in st.session_state:
             st.session_state["impedimentos_input"] = "Nenhum."
         if "duvidas_input" not in st.session_state:
             st.session_state["duvidas_input"] = "Nenhuma."
 
-        impedimentos = st.text_area(
-            "Impedimentos", key="impedimentos_input",
-            help="Puxado automaticamente dos registros marcados como 🚧 Impedimento no período acima. Edite livremente.",
-        )
-        duvidas = st.text_area(
-            "Dúvidas", key="duvidas_input",
-            help="Puxado automaticamente dos registros marcados como ❓ Dúvida no período acima. Edite livremente.",
-        )
+        # O PORQUE: lado a lado (2 colunas) em vez de um embaixo do outro --
+        # os dois textos costumam ser curtos, e ficam mais fáceis de comparar
+        # de relance quando estão na mesma altura da tela.
+        col_imp, col_duv = st.columns(2)
+        with col_imp:
+            impedimentos = st.text_area(
+                "Impedimentos", key="impedimentos_input",
+                help="Puxado automaticamente dos registros marcados como 🚧 Impedimento no período acima. Edite livremente.",
+            )
+        with col_duv:
+            duvidas = st.text_area(
+                "Dúvidas", key="duvidas_input",
+                help="Puxado automaticamente dos registros marcados como ❓ Dúvida no período acima. Edite livremente.",
+            )
 
         def _format_bullets(text: str) -> str:
             # O PORQUE: antes, só a 1ª linha de Impedimentos/Dúvidas ganhava o
@@ -2988,7 +3208,7 @@ if is_admin:
             st.markdown("---")
             if pending_changes:
                 st.info("⚠️ Salve as alterações no texto corrido acima para liberar o download.")
-            c_down_txt, c_down_pdf = st.columns(2)
+            c_down_txt, c_down_pdf, c_down_graf = st.columns(3)
             with c_down_txt:
                 st.download_button(
                     label="⬇️ Baixar Resumo da Daily (.txt)",
@@ -2999,6 +3219,14 @@ if is_admin:
                     type="primary",
                     disabled=pending_changes,
                 )
+            with c_down_graf:
+                # O PORQUE: botão em vez de mostrar direto -- pedido explícito
+                # (não precisa aparecer sozinho, só quando o usuário quiser ver).
+                # Só marca um "quero ver" em session_state -- os gráficos de
+                # verdade são montados mais abaixo, fora deste "with", tanto
+                # faz se foi clicado agora ou num rerun anterior.
+                if st.button("📊 Ver Gráficos do Período", use_container_width=True, disabled=pending_changes):
+                    st.session_state["daily_mostrar_graficos"] = True
             with c_down_pdf:
                 if st.button("📄 Gerar PDF da Daily", use_container_width=True, disabled=pending_changes):
                     with st.spinner("Montando o PDF..."):
@@ -3013,22 +3241,50 @@ if is_admin:
                             (f"{len(rep['df_ontem']) + len(rep['df_hoje'])}", "Registros"),
                         ]
 
-                        paragrafos_pdf = [
-                            (f"O que fiz ontem ({rep['d_ontem'].strftime('%d/%m/%Y')}):", "Heading4"),
-                        ]
+                        # O PORQUE: antes, "O que fiz ontem"/"O que farei hoje"
+                        # eram texto solto (bullet points via Paragraph) -- sem
+                        # ser uma Table de verdade, não tinha como aplicar o
+                        # sombreamento alternado (esse efeito só existe pra
+                        # linhas de uma tabela). Convertido pra tabela (Projeto |
+                        # Descrição | Horas) -- ganha o zebra automaticamente,
+                        # de graça, pela mesma função que já faz isso em
+                        # "Resumo por Projeto".
+                        tabelas_pdf = []
+
+                        # O PORQUE: largura da página A4 (210mm) menos as margens
+                        # (18mm de cada lado, mesmo valor usado dentro de
+                        # gerar_pdf_relatorio) -- "Descrição" precisa de bem mais
+                        # espaço que "Projeto"/"Horas", senão o texto longo das
+                        # tarefas não cabe e a tabela estoura a página.
+                        from reportlab.lib.units import mm as _mm_pdf
+                        _largura_pdf_util = (210 - 36) * _mm_pdf
+                        larguras_atividades = [_largura_pdf_util * 0.22, _largura_pdf_util * 0.63, _largura_pdf_util * 0.15]
+
+                        def _linhas_tabela_atividades(df):
+                            return [[row["project"], row["description"], f"{row['effort_hours']}h"] for _, row in df.iterrows()]
+
+                        if not rep["df_ontem"].empty:
+                            tabelas_pdf.append((
+                                f"O que fiz ontem ({rep['d_ontem'].strftime('%d/%m/%Y')})",
+                                ["Projeto", "Descrição", "Horas"],
+                                _linhas_tabela_atividades(rep["df_ontem"]),
+                                larguras_atividades,
+                            ))
+                        if not rep["df_hoje"].empty:
+                            tabelas_pdf.append((
+                                f"O que farei hoje ({rep['d_hoje'].strftime('%d/%m/%Y')})",
+                                ["Projeto", "Descrição", "Horas"],
+                                _linhas_tabela_atividades(rep["df_hoje"]),
+                                larguras_atividades,
+                            ))
+
+                        paragrafos_pdf = []
                         if rep["df_ontem"].empty:
-                            paragrafos_pdf.append("Sem registros mapeados.")
-                        else:
-                            for _, row in rep["df_ontem"].iterrows():
-                                paragrafos_pdf.append(f"• [{row['project']}] {row['description']} ({row['effort_hours']}h)")
-                        paragrafos_pdf.append("")
-                        paragrafos_pdf.append((f"O que farei hoje ({rep['d_hoje'].strftime('%d/%m/%Y')}):", "Heading4"))
+                            paragrafos_pdf.append((f"O que fiz ontem ({rep['d_ontem'].strftime('%d/%m/%Y')}): sem registros mapeados.", "Heading4"))
                         if rep["df_hoje"].empty:
-                            paragrafos_pdf.append("Sem registros mapeados.")
-                        else:
-                            for _, row in rep["df_hoje"].iterrows():
-                                paragrafos_pdf.append(f"• [{row['project']}] {row['description']} ({row['effort_hours']}h)")
-                        paragrafos_pdf.append("")
+                            paragrafos_pdf.append((f"O que farei hoje ({rep['d_hoje'].strftime('%d/%m/%Y')}): sem registros mapeados.", "Heading4"))
+                        if paragrafos_pdf:
+                            paragrafos_pdf.append("")
                         paragrafos_pdf.append(("Impedimentos:", "Heading4"))
                         paragrafos_pdf.append(rep['impedimentos'] or "Nenhum.")
                         paragrafos_pdf.append("")
@@ -3057,6 +3313,7 @@ if is_admin:
                             subtitulo=f"Gerado em {datetime.today().strftime('%d/%m/%Y %H:%M')}",
                             kpis=kpis_pdf,
                             paragrafos=paragrafos_pdf,
+                            tabelas=tabelas_pdf,
                             figuras=figuras_pdf,
                         )
                     st.download_button(
@@ -3064,6 +3321,44 @@ if is_admin:
                         file_name=f"daily_{datetime.today().strftime('%Y%m%d')}.pdf",
                         mime="application/pdf", use_container_width=True, type="primary",
                     )
+
+            # O PORQUE: só monta/mostra os gráficos quando pedido (o botão
+            # "Ver Gráficos do Período" acima só liga esta chave) -- gráfico
+            # interativo (Plotly) tem um custo de render que não vale a pena
+            # pagar toda vez que a Daily é gerada, se a pessoa só quer o texto.
+            if st.session_state.get("daily_mostrar_graficos") and not pending_changes:
+                df_daily_combo_tela = pd.concat([
+                    rep["df_ontem"].assign(Período=f"Ontem ({rep['d_ontem'].strftime('%d/%m')})"),
+                    rep["df_hoje"].assign(Período=f"Hoje ({rep['d_hoje'].strftime('%d/%m')})"),
+                ], ignore_index=True) if not (rep["df_ontem"].empty and rep["df_hoje"].empty) else pd.DataFrame()
+
+                st.markdown("---")
+                st.subheader("📊 Gráficos do Período")
+                if df_daily_combo_tela.empty:
+                    st.info("Sem registros no período pra montar gráfico.")
+                else:
+                    renderizar_toggle_colunas_grafico("daily")
+                    c_graf1, c_graf2 = obter_par_colunas_grafico("daily")
+                    with c_graf1:
+                        fig_daily_proj = px.bar(
+                            df_daily_combo_tela.groupby(["Período", "project"], as_index=False)["effort_hours"].sum(),
+                            x="project", y="effort_hours", color="Período", barmode="group",
+                            title="Horas por Projeto (Ontem x Hoje)",
+                            labels={"project": "Projeto", "effort_hours": "Horas"},
+                        )
+                        apply_responsive_layout(fig_daily_proj, rotate_xaxis=True)
+                        st.plotly_chart(fig_daily_proj, use_container_width=True)
+                    with c_graf2:
+                        if df_daily_combo_tela["category"].nunique() > 1:
+                            fig_daily_cat = px.pie(
+                                df_daily_combo_tela.groupby("category", as_index=False)["effort_hours"].sum(),
+                                values="effort_hours", names="category", hole=0.4,
+                                title="Horas por Categoria (Ontem + Hoje)",
+                            )
+                            apply_responsive_layout(fig_daily_cat)
+                            st.plotly_chart(fig_daily_cat, use_container_width=True)
+                        else:
+                            st.caption("Só uma categoria no período -- sem gráfico de proporção pra mostrar.")
 
     # ==========================================
     # TAB 3: DASHBOARD, RELATÓRIOS E EXPORTAÇÃO
@@ -3215,7 +3510,8 @@ with tab_dashboard:
 
                     st.markdown("---")
                     st.subheader("Como o Tempo foi Distribuído")
-                    c_chart1, c_chart2 = st.columns(2)
+                    renderizar_toggle_colunas_grafico("dashboard")
+                    c_chart1, c_chart2 = obter_par_colunas_grafico("dashboard")
                     with c_chart1:
                         df_bar_grouped = (
                             df_filtered.groupby(["period_start", "period_label", "project"])["effort_hours"]
@@ -3245,7 +3541,7 @@ with tab_dashboard:
 
                     st.markdown("---")
                     st.subheader("Tendência ao Longo do Tempo e Análise de Pareto")
-                    c_chart3, c_chart4 = st.columns(2)
+                    c_chart3, c_chart4 = obter_par_colunas_grafico("dashboard")
 
                     with c_chart3:
                         # O PORQUE: Gráfico de linhas mostra a tendência de horas
