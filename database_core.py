@@ -229,6 +229,39 @@ class LogRepository:
         """
         self.conn.execute(query_access_requests)
         self._ensure_column("access_requests", "expires_at", "TIMESTAMP")
+
+        # O PORQUE: tabela pra guardar preferências/ajustes por usuário que
+        # não fazem parte do fluxo normal de atividades -- o primeiro uso é
+        # o "saldo inicial" do Banco de Horas (um ponto de partida, ex.:
+        # banco de horas que a pessoa já tinha antes de começar a rastrear
+        # isso no app; sem isso, o cálculo sempre começaria do zero, ignorando
+        # qualquer saldo anterior). username é chave única -- 1 linha por
+        # pessoa, sempre UPDATE/INSERT nela, nunca duplica.
+        query_user_settings = """
+        CREATE TABLE IF NOT EXISTS user_settings (
+            username TEXT PRIMARY KEY,
+            banco_horas_saldo_inicial REAL NOT NULL DEFAULT 0
+        );
+        """
+        self.conn.execute(query_user_settings)
+        self.conn.commit()
+
+    def get_banco_horas_saldo_inicial(self, username: str) -> float:
+        row = self.conn.execute(
+            "SELECT banco_horas_saldo_inicial FROM user_settings WHERE username = ?", (username,)
+        ).fetchone()
+        return float(row[0]) if row else 0.0
+
+    def set_banco_horas_saldo_inicial(self, username: str, valor: float):
+        # O PORQUE: INSERT ... ON CONFLICT (não UPDATE simples) -- funciona
+        # tanto na primeira vez que a pessoa define um saldo (linha ainda
+        # não existe) quanto nas próximas (linha já existe), sem precisar
+        # checar antes se já tem registro ou não.
+        self.conn.execute(
+            "INSERT INTO user_settings (username, banco_horas_saldo_inicial) VALUES (?, ?) "
+            "ON CONFLICT(username) DO UPDATE SET banco_horas_saldo_inicial = excluded.banco_horas_saldo_inicial",
+            (username, valor),
+        )
         self.conn.commit()
 
     def _ensure_column(self, table: str, column: str, column_def: str):

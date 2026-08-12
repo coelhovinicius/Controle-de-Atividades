@@ -1207,9 +1207,23 @@ def gerar_pdf_relatorio(titulo: str, subtitulo: str, paragrafos: list = None, fi
         # só a imagem (que já é auto-suficiente) -- se não couber no
         # espaço restante da página, ela inteira passa pra próxima, sem
         # deixar nada pra trás.
-        largura_pol, altura_pol = fig.get_size_inches()
-        razao_altura_largura = altura_pol / largura_pol
         png_bytes = _mpl_fig_para_png_bytes(fig)
+
+        # O PORQUE: mede a proporção da IMAGEM JÁ SALVA (depois do corte
+        # bbox_inches="tight" em _mpl_fig_para_png_bytes), não do figsize
+        # nominal usado pra criar a figura. O corte "tight" remove espaço
+        # em branco sobrando ao redor do conteúdo real -- e pode remover
+        # quantidades BEM diferentes de cada lado (ex.: rótulos de uma
+        # pizza que se espalham mais na horizontal que na vertical, ou
+        # vice-versa, dependendo de quantas fatias/nomes tem). Usar o
+        # figsize original (de antes do corte) pra decidir a proporção da
+        # caixa no PDF ficava incompatível com o formato real da imagem
+        # depois de cortada -- e é isso que causava a pizza saindo
+        # esticada (numa direção ou na outra, dependendo do gráfico).
+        from PIL import Image as _PILImage
+        img_info = _PILImage.open(io.BytesIO(png_bytes))
+        largura_px, altura_px = img_info.size
+        razao_altura_largura = altura_px / largura_px
 
         altura_maxima = 100 * mm
         largura_final = largura_util
@@ -1598,6 +1612,131 @@ def render_admin_solicitacoes():
 # nesse e em qualquer registro futuro, inclusive após sincronização via
 # upload de txt/csv (que só mexe em work_logs, nunca em custom_options).
 NEW_OPTION_SENTINEL = "➕ Criar novo..."
+
+
+def render_banco_de_horas():
+    # O PORQUE: mesmo padrão do painel de Solicitações de Acesso -- área
+    # própria (não é uma aba nova), acionada por um botão na lateral, some
+    # o resto do app enquanto estiver aberta.
+    st.header("⏱️ Banco de Horas")
+    if st.button("← Voltar para o app"):
+        st.session_state.mostrar_banco_horas = False
+        st.rerun()
+
+    # O PORQUE: 11/02/2026 como piso é uma regra EXCLUSIVA desta
+    # calculadora (pedido explícito) -- nenhuma outra tela/filtro de data
+    # do app usa essa constante ou essa regra; todo o resto continua
+    # funcionando exatamente como antes.
+    DATA_MINIMA_BANCO_HORAS = datetime(2026, 2, 11).date()
+    HORAS_PADRAO_DIA = 8.0
+    hoje = agora_br().date()
+    username = _current_user()
+
+    st.caption(
+        f"Compara as horas lançadas em cada dia contra a jornada padrão de "
+        f"{HORAS_PADRAO_DIA:.0f}h. Dias sem nenhum registro são ignorados "
+        f"(não contam como déficit)."
+    )
+
+    # O PORQUE: saldo inicial -- um ponto de partida (ex.: banco de horas
+    # que a pessoa já tinha antes de começar a rastrear isso no app). Fica
+    # salvo no banco (não é só desta sessão) -- define uma vez e não
+    # precisa digitar de novo toda vez que abrir esta tela.
+    saldo_inicial_salvo = repo.get_banco_horas_saldo_inicial(username)
+    with st.expander("⚙️ Saldo inicial (opcional)", expanded=False):
+        st.caption(
+            "Ponto de partida do cálculo -- útil se você já tinha um saldo de "
+            "banco de horas antes de começar a usar esta calculadora. Fica "
+            "salvo, não precisa preencher de novo depois."
+        )
+        novo_saldo_inicial = st.number_input(
+            "Saldo inicial (horas)",
+            value=float(saldo_inicial_salvo),
+            step=0.5,
+            format="%.2f",
+            key="banco_horas_saldo_inicial_input",
+        )
+        if st.button("💾 Salvar saldo inicial"):
+            repo.set_banco_horas_saldo_inicial(username, novo_saldo_inicial)
+            st.success("Saldo inicial salvo.")
+            st.rerun()
+
+    col_ini, col_fim = st.columns(2)
+    with col_ini:
+        data_inicio = st.date_input(
+            "De",
+            value=st.session_state.get("banco_horas_inicio", DATA_MINIMA_BANCO_HORAS),
+            min_value=DATA_MINIMA_BANCO_HORAS,
+            format="DD/MM/YYYY",
+            key="banco_horas_inicio",
+        )
+    with col_fim:
+        data_fim = st.date_input(
+            "Até",
+            value=st.session_state.get("banco_horas_fim", hoje),
+            min_value=DATA_MINIMA_BANCO_HORAS,
+            format="DD/MM/YYYY",
+            key="banco_horas_fim",
+        )
+
+    if data_fim < data_inicio:
+        st.error("A data final não pode ser anterior à data inicial.")
+        return
+
+    df = repo.get_all_logs_as_dataframe(username)
+    if df.empty:
+        st.info("Nenhum registro encontrado.")
+        return
+
+    df["log_date_dt"] = pd.to_datetime(df["log_date"]).dt.date
+    mask = (df["log_date_dt"] >= data_inicio) & (df["log_date_dt"] <= data_fim)
+    df_periodo = df[mask]
+
+    if df_periodo.empty:
+        st.info("Nenhum registro no período selecionado.")
+        return
+
+    # O PORQUE: agrupa por dia e soma as horas -- só dias que aparecem
+    # aqui (ou seja, que TÊM pelo menos um registro) entram na conta. Um
+    # dia sem nenhuma linha simplesmente não aparece no groupby, então não
+    # é contado nem como déficit nem como excedente -- é como se não
+    # existisse pro cálculo (pedido explícito do usuário).
+    horas_por_dia = df_periodo.groupby("log_date_dt")["effort_hours"].sum().reset_index()
+    horas_por_dia.columns = ["Data", "Horas Trabalhadas"]
+    horas_por_dia["Diferença"] = horas_por_dia["Horas Trabalhadas"] - HORAS_PADRAO_DIA
+    horas_por_dia = horas_por_dia.sort_values("Data")
+
+    saldo_calculado_periodo = horas_por_dia["Diferença"].sum()
+    total_banco_horas = saldo_inicial_salvo + saldo_calculado_periodo
+
+    st.markdown("---")
+    sinal = "+" if total_banco_horas >= 0 else ""
+    st.metric(
+        "Saldo do Banco de Horas",
+        f"{sinal}{total_banco_horas:.2f}h".replace(".", ","),
+    )
+    if saldo_inicial_salvo != 0:
+        sinal_ini = "+" if saldo_inicial_salvo >= 0 else ""
+        sinal_calc = "+" if saldo_calculado_periodo >= 0 else ""
+        st.caption(
+            f"Saldo inicial: {sinal_ini}{saldo_inicial_salvo:.2f}h".replace(".", ",")
+            + f" • Calculado no período: {sinal_calc}{saldo_calculado_periodo:.2f}h".replace(".", ",")
+        )
+    st.caption(
+        f"Período: {data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')} • "
+        f"{len(horas_por_dia)} dia(s) com registro considerado(s)"
+    )
+
+    st.markdown("##### Detalhamento por dia")
+    tabela_exibicao = horas_por_dia.copy()
+    tabela_exibicao["Data"] = tabela_exibicao["Data"].apply(lambda d: d.strftime("%d/%m/%Y"))
+    tabela_exibicao["Horas Trabalhadas"] = tabela_exibicao["Horas Trabalhadas"].apply(
+        lambda h: f"{h:.2f}h".replace(".", ",")
+    )
+    tabela_exibicao["Diferença"] = tabela_exibicao["Diferença"].apply(
+        lambda d: (f"+{d:.2f}h" if d >= 0 else f"{d:.2f}h").replace(".", ",")
+    )
+    st.dataframe(tabela_exibicao, use_container_width=True, hide_index=True)
 
 
 def creatable_option_picker(label: str, option_type: str, options_fn, key_prefix: str, current_value: str = None):
@@ -2455,6 +2594,16 @@ if is_admin:
             if qtd_pendentes:
                 st.caption(f"🔔 {qtd_pendentes} pendente(s)")
 
+# O PORQUE: disponível pra admin E convidado (não só admin) -- é um cálculo
+# a partir dos mesmos registros que já aparecem no Dashboard, que o
+# convidado já vê em modo leitura; não é uma ação que modifica dado
+# nenhum, só mostra um número calculado.
+with st.sidebar:
+    st.markdown("---")
+    st.session_state.setdefault("mostrar_banco_horas", False)
+    if st.button("⏱️ Banco de Horas", use_container_width=True):
+        st.session_state.mostrar_banco_horas = not st.session_state.mostrar_banco_horas
+
 # O PORQUE: "Logado como" + "Sair" ficam por último de propósito -- é o
 # fim natural do menu, junto de qualquer outra coisa que ainda venha a ser
 # adicionada na barra lateral no futuro (a intenção é que esse bloco sempre
@@ -2472,6 +2621,10 @@ st.title("📊 Task Tracker")
 
 if is_admin and st.session_state.get("mostrar_admin_solicitacoes"):
     render_admin_solicitacoes()
+    st.stop()
+
+if st.session_state.get("mostrar_banco_horas"):
+    render_banco_de_horas()
     st.stop()
 
 if is_admin:
