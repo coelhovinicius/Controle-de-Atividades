@@ -3,6 +3,26 @@ import sqlite3
 import pandas as pd
 import sys
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+# O PORQUE: datetime.now() sozinho pega o horário do SISTEMA rodando o
+# servidor -- no Streamlit Community Cloud, isso é UTC (Greenwich), não o
+# horário de Brasília. Use SEMPRE agora_br() daqui pra frente.
+FUSO_BRASILIA = ZoneInfo("America/Sao_Paulo")
+
+
+def agora_br() -> datetime:
+    return datetime.now(FUSO_BRASILIA)
+
+
+def _comparar_com_agora_br(timestamp_iso: str) -> bool:
+    """True se o timestamp ISO já passou de agora. Trata tanto timestamps
+    antigos (sem fuso -- assume que já era horário de Brasília) quanto
+    novos (já com fuso embutido), sem quebrar a comparação."""
+    dt = datetime.fromisoformat(timestamp_iso)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=FUSO_BRASILIA)
+    return agora_br() > dt
 
 # O PORQUE: Definição de credenciais via variáveis de ambiente.
 # No Streamlit Cloud, estas serão lidas das 'Secrets'. No Windows local,
@@ -36,6 +56,58 @@ WORK_LOGS_COLUMNS = [
     "effort_hours", "created_at", "is_impedimento", "is_duvida", "username",
 ]
 
+class _ConexaoComRetentativa:
+    """
+    Envelopa a conexão de verdade (libsql ou sqlite3) e reconecta
+    automaticamente se uma operação falhar por causa de uma conexão
+    velha/inválida -- ex.: a sessão HTTP com o Turso expirar depois de
+    muito tempo sem uso real. Isso PODE acontecer mesmo com o app mantido
+    "acordado" por um script externo: o Streamlit não dormir não garante
+    que a conexão com o Turso continua válida pra sempre -- são dois
+    relógios diferentes. Sem isso, esse tipo de falha só se resolvia com
+    um reboot manual do app (limpando o cache do Streamlit, que é onde a
+    conexão antiga ficava presa).
+
+    Só tenta reconectar quando o erro PARECE ser de conexão (bate com uma
+    das palavras-chave abaixo) -- um erro de SQL genuíno (ex.: coluna que
+    não existe) continuaria dando erro numa conexão nova também, então
+    tentar de novo só atrasaria a mensagem de erro real sem resolver nada;
+    nesses casos, deixa o erro original subir normalmente.
+    """
+    _PALAVRAS_CHAVE_CONEXAO_VELHA = (
+        "hrana", "stream", "connection", "closed", "timeout",
+        "broken pipe", "network", "reset by peer",
+    )
+
+    def __init__(self, fabrica_conexao):
+        self._fabrica_conexao = fabrica_conexao
+        self._conn = fabrica_conexao()
+
+    def _com_retentativa(self, nome_metodo, *args, **kwargs):
+        try:
+            return getattr(self._conn, nome_metodo)(*args, **kwargs)
+        except Exception as e:
+            mensagem = str(e).lower()
+            parece_conexao_velha = any(p in mensagem for p in self._PALAVRAS_CHAVE_CONEXAO_VELHA)
+            if not parece_conexao_velha:
+                raise
+            print(f"AVISO: conexão parecia velha/inválida ({e}) -- reconectando e tentando de novo.", file=sys.stderr)
+            self._conn = self._fabrica_conexao()
+            return getattr(self._conn, nome_metodo)(*args, **kwargs)
+
+    def execute(self, *args, **kwargs):
+        return self._com_retentativa("execute", *args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        return self._com_retentativa("executemany", *args, **kwargs)
+
+    def commit(self, *args, **kwargs):
+        return self._com_retentativa("commit", *args, **kwargs)
+
+    def rollback(self, *args, **kwargs):
+        return self._com_retentativa("rollback", *args, **kwargs)
+
+
 class DatabaseConnection:
     def __init__(self, db_name: str = "personal_tracker.db"):
         self.db_name = db_name
@@ -45,22 +117,32 @@ class DatabaseConnection:
                                    # disco efêmero, dados "somem" a cada deploy).
 
     def get_connection(self):
+        def _criar_conexao_turso():
+            import libsql
+            conn = libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+            # O PORQUE: connect() do libsql não faz nenhuma chamada de
+            # rede -- só monta o cliente. Se a URL ou o token estiverem
+            # errados/expirados, o erro só aparece na PRIMEIRA consulta
+            # real, e o libsql embrulha esse erro (incluindo falhas de
+            # autenticação) como ValueError genérico. Sem este teste
+            # aqui, esse ValueError estourava sem tratamento lá na
+            # frente (dentro de _initialize_database), derrubando o app
+            # inteiro com uma mensagem redigida pelo Streamlit Cloud.
+            conn.execute("SELECT 1")
+            return conn
+
         # Tenta conectar ao Turso se as credenciais estiverem presentes
         if TURSO_DATABASE_URL and TURSO_AUTH_TOKEN:
             try:
-                import libsql
-                conn = libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
-                # O PORQUE: connect() do libsql não faz nenhuma chamada de
-                # rede -- só monta o cliente. Se a URL ou o token estiverem
-                # errados/expirados, o erro só aparece na PRIMEIRA consulta
-                # real, e o libsql embrulha esse erro (incluindo falhas de
-                # autenticação) como ValueError genérico. Sem este teste
-                # aqui, esse ValueError estourava sem tratamento lá na
-                # frente (dentro de _initialize_database), derrubando o app
-                # inteiro com uma mensagem redigida pelo Streamlit Cloud.
-                conn.execute("SELECT 1")
+                # O PORQUE: _ConexaoComRetentativa (não a conexão crua) --
+                # ela já chama _criar_conexao_turso() aqui dentro pra testar
+                # a conexão (mesmo comportamento de antes), mas também
+                # guarda essa função pra poder reconectar sozinha depois,
+                # se algum dia essa conexão específica ficar velha/inválida
+                # em uso normal (não só na hora de abrir).
+                conexao = _ConexaoComRetentativa(_criar_conexao_turso)
                 self.using_turso = True
-                return conn
+                return conexao
             except ImportError:
                 msg = "Driver 'libsql' não está instalado no ambiente."
                 print(f"AVISO: {msg}", file=sys.stderr)
@@ -81,6 +163,8 @@ class DatabaseConnection:
 
         # Fallback padrão para SQLite local -- só é alcançado quando
         # REQUIRE_TURSO é False (comportamento de desenvolvimento local).
+        # Não precisa do envelope de retentativa: é um arquivo local, não
+        # uma conexão de rede que possa "expirar" com o tempo.
         self.using_turso = False
         return sqlite3.connect(self.db_name, check_same_thread=False)
 
@@ -374,7 +458,7 @@ class LogRepository:
         # link para de funcionar sozinho.
         import secrets as _secrets
         token = _secrets.token_urlsafe(24)
-        expires_at = (datetime.now() + timedelta(days=dias_validade)).isoformat() if dias_validade > 0 else None
+        expires_at = (agora_br() + timedelta(days=dias_validade)).isoformat() if dias_validade > 0 else None
         self.conn.execute(
             "UPDATE access_requests SET status = 'approved', access_token = ?, decided_at = CURRENT_TIMESTAMP, expires_at = ? WHERE id = ?",
             (token, expires_at, request_id),
@@ -388,7 +472,7 @@ class LogRepository:
         # trocaria o token, invalidando um link já compartilhado).
         # dias_validade: 0 (ou negativo) = remove a expiração (passa a
         # valer até ser revogado manualmente).
-        expires_at = (datetime.now() + timedelta(days=dias_validade)).isoformat() if dias_validade > 0 else None
+        expires_at = (agora_br() + timedelta(days=dias_validade)).isoformat() if dias_validade > 0 else None
         self.conn.execute(
             "UPDATE access_requests SET expires_at = ? WHERE id = ?",
             (expires_at, request_id),
@@ -426,7 +510,7 @@ class LogRepository:
         expires_at_str = row[4]
         if expires_at_str:
             try:
-                if datetime.fromisoformat(str(expires_at_str)) < datetime.now():
+                if _comparar_com_agora_br(str(expires_at_str)):
                     return None
             except Exception:
                 # O PORQUE: um valor de data mal formado não deve travar o

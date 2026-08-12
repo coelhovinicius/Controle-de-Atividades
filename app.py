@@ -17,6 +17,7 @@ import requests
 import secrets as pysecrets
 from io import StringIO
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from database_core import DatabaseConnection, LogRepository, TursoRequiredError
 from importer_core import HistoryParser
 
@@ -91,6 +92,38 @@ if not repo.db_connection.using_turso and (os.environ.get("TURSO_DATABASE_URL") 
 #   [credentials]
 #   "seu_usuario" = "$2b$12$...hash bcrypt, gerado com gerar_hash_senha.py..."
 
+# O PORQUE: datetime.now()/datetime.today() sozinhos pegam o horário do
+# SISTEMA que roda o servidor -- no Streamlit Community Cloud, isso é UTC
+# (Greenwich), não o horário de Brasília, mesmo o público sendo daqui (é
+# por isso que rodando local -- Windows já configurado pro fuso certo --
+# os horários saíam certos, e publicado saíam 3h adiantados). Esta função
+# sempre devolve o horário de Brasília de verdade (America/Sao_Paulo,
+# UTC-3, sem horário de verão desde 2019), rodando local ou publicado, sem
+# depender do fuso configurado na máquina que executa o servidor. Use
+# SEMPRE agora_br() no lugar de datetime.now()/datetime.today() daqui pra
+# frente, em qualquer parte nova do app.
+FUSO_BRASILIA = ZoneInfo("America/Sao_Paulo")
+
+
+def agora_br() -> datetime:
+    return datetime.now(FUSO_BRASILIA)
+
+
+def _comparar_com_agora_br(timestamp_iso: str) -> bool:
+    """
+    Devolve True se o timestamp (armazenado em formato ISO) já passou do
+    agora. Lida tanto com timestamps ANTIGOS (salvos antes desta correção,
+    sem informação de fuso -- nesse caso, assume que já era horário de
+    Brasília, que é o que o servidor gerava localmente até aqui) quanto com
+    os NOVOS (já salvos com fuso embutido) -- sem isso, comparar um
+    timestamp antigo (sem fuso) com agora_br() (com fuso) quebraria com
+    erro de tipo.
+    """
+    dt = datetime.fromisoformat(timestamp_iso)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=FUSO_BRASILIA)
+    return agora_br() > dt
+
 # O PORQUE: st.session_state é por sessão de navegador e se perde ao
 # recarregar a página (F5) -- por isso, sozinho, não sustenta "ficar logado
 # até clicar em Sair". O token vai para um COOKIE (gravado no navegador via
@@ -161,7 +194,7 @@ def _obter_user_agent_hash() -> str:
 
 
 def _criar_sessao(username: str) -> str:
-    expires_at = (datetime.now() + timedelta(hours=SESSION_TTL_HOURS)).isoformat()
+    expires_at = (agora_br() + timedelta(hours=SESSION_TTL_HOURS)).isoformat()
     ua_hash = _obter_user_agent_hash()
     payload = f"{username}|{expires_at}|{ua_hash}"
     payload_b64 = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("utf-8").rstrip("=")
@@ -187,11 +220,19 @@ def _validar_sessao(token: str):
         padding = "=" * (-len(payload_b64) % 4)
         payload = base64.urlsafe_b64decode(payload_b64 + padding).decode("utf-8")
         username, expires_at_iso, ua_hash_esperado = payload.rsplit("|", 2)
-        expires_at = datetime.fromisoformat(expires_at_iso)
     except Exception:
         return None
 
-    if datetime.now() > expires_at:
+    # O PORQUE: _comparar_com_agora_br() (não uma comparação direta) --
+    # tokens criados ANTES desta correção de fuso não têm informação de
+    # fuso embutida; comparar direto com agora_br() (que tem fuso) quebraria
+    # com erro de tipo. A função trata os dois casos sem crashar -- pior
+    # cenário, alguém logado bem na hora do deploy tem a sessão encerrada
+    # um pouco mais cedo ou mais tarde que o normal, nada grave.
+    try:
+        if _comparar_com_agora_br(expires_at_iso):
+            return None
+    except Exception:
         return None
 
     # O PORQUE: aqui é onde a amarração ao navegador é de fato aplicada --
@@ -371,28 +412,26 @@ def _tela_login():
             password = st.text_input("Senha", type="password")
             entrar = st.form_submit_button("Entrar", type="primary", use_container_width=True)
 
-        # O PORQUE: Streamlit não tem um parâmetro nativo de "autofocus" pra
-        # widgets -- precisa de um empurrãozinho via JS. Procura pelo
-        # aria-label do campo (mais confiável que "primeiro input da
-        # página", que quebraria se algum dia um campo de busca/outro form
-        # aparecer antes deste na tela). O try/catch de window.top vs
-        # window.parent é o mesmo padrão já usado no cookie de sessão --
-        # o componente roda num iframe, então precisa "escapar" pra alcançar
-        # o campo de verdade na página.
-        st.components.v1.html(
+        # O PORQUE: st.components.v1.html() roda dentro de um iframe --
+        # localmente costuma dar pra "escapar" dele via window.top/parent
+        # pra alcançar a página de verdade, mas publicado (Streamlit Cloud)
+        # esse acesso é bloqueado por segurança do navegador (o iframe é
+        # tratado como origem diferente, mesmo sendo o mesmo site) -- é
+        # exatamente por isso que funcionava local e não online. st.html()
+        # com unsafe_allow_javascript=True resolve isso: o conteúdo entra
+        # DIRETO na página principal, sem iframe nenhum, então o script já
+        # nasce no lugar certo -- sem precisar de nenhum truque pra escapar
+        # de onde quer que seja.
+        st.html(
             """
             <script>
-            function focarCampoUsuario(doc) {
-                const campo = doc.querySelector('input[aria-label="Usuário"]');
-                if (campo) { campo.focus(); }
+            const campo = document.querySelector('input[aria-label="Usuário"]');
+            if (campo) {
+                setTimeout(function() { campo.focus(); }, 150);
             }
-            setTimeout(function() {
-                try { focarCampoUsuario(window.top.document); }
-                catch (e) { focarCampoUsuario(window.parent.document); }
-            }, 150);
             </script>
             """,
-            height=0,
+            unsafe_allow_javascript=True,
         )
 
         if entrar:
@@ -1058,7 +1097,7 @@ def gerar_pdf_relatorio(titulo: str, subtitulo: str, paragrafos: list = None, fi
         canvas.drawString(18 * mm, A4[1] - 9.5 * mm, "Task Tracker")
         canvas.setFillColor(cor_muted)
         canvas.setFont("Helvetica", 8)
-        canvas.drawString(18 * mm, 10 * mm, f"Gerado em {datetime.now().strftime('%d/%m/%Y às %H:%M')}")
+        canvas.drawString(18 * mm, 10 * mm, f"Gerado em {agora_br().strftime('%d/%m/%Y às %H:%M')}")
         canvas.drawRightString(A4[0] - 18 * mm, 10 * mm, f"Página {documento.page}")
         canvas.restoreState()
 
@@ -1511,7 +1550,7 @@ def render_admin_solicitacoes():
                     if expira_em:
                         try:
                             expira_fmt = datetime.fromisoformat(str(expira_em)).strftime("%d/%m/%Y às %H:%M")
-                            if datetime.fromisoformat(str(expira_em)) < datetime.now():
+                            if _comparar_com_agora_br(str(expira_em)):
                                 st.caption(f"⏳ Expirou em {expira_fmt} (o link já não funciona mais, mesmo sem revogar).")
                             else:
                                 st.caption(f"⏳ Expira em {expira_fmt}.")
@@ -1699,7 +1738,7 @@ def reset_add_form_stay():
         st.session_state.pop(k, None)
     st.session_state["add_description"] = ""
     st.session_state["add_effort"] = 1.0
-    st.session_state["add_log_date"] = datetime.today().date()
+    st.session_state["add_log_date"] = agora_br().date()
     st.session_state["add_is_impedimento"] = False
     st.session_state["add_is_duvida"] = False
 
@@ -2364,11 +2403,11 @@ if is_admin:
                 c_recalc1, c_recalc2 = st.columns(2)
                 with c_recalc1:
                     recalc_start = st.date_input(
-                        "De", value=dash_start or datetime.today().date(), format="DD/MM/YYYY", key="ia_recalc_start"
+                        "De", value=dash_start or agora_br().date(), format="DD/MM/YYYY", key="ia_recalc_start"
                     )
                 with c_recalc2:
                     recalc_end = st.date_input(
-                        "Até", value=dash_end or datetime.today().date(), format="DD/MM/YYYY", key="ia_recalc_end"
+                        "Até", value=dash_end or agora_br().date(), format="DD/MM/YYYY", key="ia_recalc_end"
                     )
 
             btn_recalcular_ia = st.button(
@@ -2494,7 +2533,7 @@ with tab_manage:
         # de calendário atrás até hoje", calculado na hora (nunca uma data
         # travada) -- e, uma vez que o usuário aplicar outro período, ele
         # se mantém (mesmo padrão da aba Dashboard) até ser trocado de novo.
-        hoje_grid = datetime.today().date()
+        hoje_grid = agora_br().date()
         default_grid_start = hoje_grid - timedelta(days=10)
 
         with st.form("grid_filter_form"):
@@ -2675,11 +2714,20 @@ with tab_manage:
                 # linha de dados) ganham o fundo. Roda de novo a cada rerun
                 # (troca de página, ordenação, novo registro etc.), já que
                 # este componente é redesenhado do zero em toda execução.
-                st.components.v1.html(
+                #
+                # O PORQUE de st.html() em vez de st.components.v1.html():
+                # o segundo roda dentro de um iframe -- localmente costuma
+                # dar pra "escapar" dele via window.top/parent, mas
+                # publicado (Streamlit Cloud) esse acesso é bloqueado por
+                # segurança do navegador (iframe tratado como origem
+                # diferente, mesmo sendo o mesmo site) -- por isso
+                # funcionava local e não online. st.html() não usa iframe
+                # nenhum -- o script já nasce direto na página de verdade.
+                st.html(
                     """
                     <script>
-                    function aplicarZebraGrid(doc) {
-                        const grid = doc.querySelector('.st-key-atividades_grid');
+                    function aplicarZebraGrid() {
+                        const grid = document.querySelector('.st-key-atividades_grid');
                         if (!grid) return;
                         const todosBlocos = Array.from(grid.querySelectorAll('[data-testid="stHorizontalBlock"]'));
                         // O PORQUE: a coluna "Ações" tem um st.columns() ANINHADO
@@ -2708,13 +2756,10 @@ with tab_manage:
                             }
                         });
                     }
-                    setTimeout(function() {
-                        try { aplicarZebraGrid(window.top.document); }
-                        catch (e) { aplicarZebraGrid(window.parent.document); }
-                    }, 250);
+                    setTimeout(aplicarZebraGrid, 250);
                     </script>
                     """,
-                    height=0,
+                    unsafe_allow_javascript=True,
                 )
 
                 # O PORQUE: os 4 elementos pedidos (Registros por página, Ir
@@ -2946,8 +2991,8 @@ if is_admin:
             "pronto para consultar durante a Daily."
         )
 
-        default_ontem = datetime.today().date() - timedelta(days=1)
-        default_hoje = datetime.today().date()
+        default_ontem = agora_br().date() - timedelta(days=1)
+        default_hoje = agora_br().date()
 
         # O PORQUE: mesmo padrão do filtro de período do Dashboard -- as duas
         # datas ficam dentro de um st.form, então trocar "Ontem" ou "Hoje" não
@@ -3071,7 +3116,7 @@ if is_admin:
                 df_hoje = pd.DataFrame(columns=["project", "description", "effort_hours"])
 
             # Versão em texto puro, usada tanto no download quanto na cópia rápida.
-            report_txt = f"=== DAILY SCRUM ===\nData: {datetime.today().strftime('%d/%m/%Y')}\n\n"
+            report_txt = f"=== DAILY SCRUM ===\nData: {agora_br().strftime('%d/%m/%Y')}\n\n"
             report_txt += f"O QUE FIZ ONTEM ({d_ontem.strftime('%d/%m/%Y')}):\n"
             if df_ontem.empty:
                 report_txt += "- Sem registros mapeados.\n"
@@ -3113,7 +3158,7 @@ if is_admin:
             rep = st.session_state.daily_report
             st.markdown("---")
             st.subheader("📋 Resumo para a Daily")
-            st.caption(f"Gerado em {datetime.today().strftime('%d/%m/%Y %H:%M')}")
+            st.caption(f"Gerado em {agora_br().strftime('%d/%m/%Y %H:%M')}")
 
             with st.container(border=True):
                 st.markdown(f"**✅ O que fiz ontem** — {rep['d_ontem'].strftime('%d/%m/%Y')}")
@@ -3245,7 +3290,7 @@ if is_admin:
                 st.download_button(
                     label="⬇️ Baixar Resumo da Daily (.txt)",
                     data=rep["report_txt"].encode("utf-8"),
-                    file_name=f"daily_{datetime.today().strftime('%Y%m%d')}.txt",
+                    file_name=f"daily_{agora_br().strftime('%Y%m%d')}.txt",
                     mime="text/plain",
                     use_container_width=True,
                     type="primary",
@@ -3342,7 +3387,7 @@ if is_admin:
 
                         pdf_bytes = gerar_pdf_relatorio(
                             titulo="Resumo para a Daily",
-                            subtitulo=f"Gerado em {datetime.today().strftime('%d/%m/%Y %H:%M')}",
+                            subtitulo=f"Gerado em {agora_br().strftime('%d/%m/%Y %H:%M')}",
                             kpis=kpis_pdf,
                             paragrafos=paragrafos_pdf,
                             tabelas=tabelas_pdf,
@@ -3350,7 +3395,7 @@ if is_admin:
                         )
                     st.download_button(
                         label="⬇️ Baixar PDF pronto", data=pdf_bytes,
-                        file_name=f"daily_{datetime.today().strftime('%Y%m%d')}.pdf",
+                        file_name=f"daily_{agora_br().strftime('%Y%m%d')}.pdf",
                         mime="application/pdf", use_container_width=True, type="primary",
                     )
 
@@ -3405,7 +3450,7 @@ with tab_dashboard:
         df_logs["log_date_dt"] = pd.to_datetime(df_logs["log_date"])
         min_db_date = df_logs["log_date_dt"].min().date()
         max_db_date = df_logs["log_date_dt"].max().date()
-        today = datetime.today().date()
+        today = agora_br().date()
         min_allowed_date = datetime.strptime("2000-01-01", "%Y-%m-%d").date()
 
         # O PORQUE: por padrão, ao abrir o Dashboard, mostramos os últimos 30
