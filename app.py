@@ -2594,15 +2594,15 @@ if is_admin:
             if qtd_pendentes:
                 st.caption(f"🔔 {qtd_pendentes} pendente(s)")
 
-# O PORQUE: disponível pra admin E convidado (não só admin) -- é um cálculo
-# a partir dos mesmos registros que já aparecem no Dashboard, que o
-# convidado já vê em modo leitura; não é uma ação que modifica dado
-# nenhum, só mostra um número calculado.
-with st.sidebar:
-    st.markdown("---")
-    st.session_state.setdefault("mostrar_banco_horas", False)
-    if st.button("⏱️ Banco de Horas", use_container_width=True):
-        st.session_state.mostrar_banco_horas = not st.session_state.mostrar_banco_horas
+# O PORQUE: só pra admin agora (pedido explícito) -- convidado (acesso só
+# por token, somente leitura) não vê nem o botão nem consegue abrir o
+# painel, mesmo tentando forçar via session_state.
+if is_admin:
+    with st.sidebar:
+        st.markdown("---")
+        st.session_state.setdefault("mostrar_banco_horas", False)
+        if st.button("⏱️ Banco de Horas", use_container_width=True):
+            st.session_state.mostrar_banco_horas = not st.session_state.mostrar_banco_horas
 
 # O PORQUE: "Logado como" + "Sair" ficam por último de propósito -- é o
 # fim natural do menu, junto de qualquer outra coisa que ainda venha a ser
@@ -2623,7 +2623,7 @@ if is_admin and st.session_state.get("mostrar_admin_solicitacoes"):
     render_admin_solicitacoes()
     st.stop()
 
-if st.session_state.get("mostrar_banco_horas"):
+if is_admin and st.session_state.get("mostrar_banco_horas"):
     render_banco_de_horas()
     st.stop()
 
