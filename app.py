@@ -3567,6 +3567,33 @@ if is_admin:
                 if df_daily_combo_tela.empty:
                     st.info("Sem registros no período pra montar gráfico.")
                 else:
+                    # O PORQUE: pedido explícito -- em vez de outro gráfico de
+                    # barra só pras horas totais por dia, um painel de números
+                    # (mesmo estilo "Seus Números" do Dashboard: Total de
+                    # Horas, Registros, Média Horas/Dia, % Impedimentos, %
+                    # Dúvidas), calculado só com os registros de Ontem+Hoje --
+                    # leitura mais rápida sem precisar interpretar gráfico
+                    # nenhum. Mesma fórmula usada no Dashboard, só que
+                    # aplicada neste recorte de 2 dias em vez do período
+                    # completo escolhido lá.
+                    total_horas_daily = df_daily_combo_tela["effort_hours"].sum()
+                    total_registros_daily = len(df_daily_combo_tela)
+                    dias_com_registro_daily = df_daily_combo_tela["Período"].nunique()
+                    media_horas_dia_daily = (total_horas_daily / dias_com_registro_daily) if dias_com_registro_daily else 0
+                    pct_impedimento_daily = (df_daily_combo_tela["is_impedimento"].astype(int).sum() / total_registros_daily * 100) if total_registros_daily else 0
+                    pct_duvida_daily = (df_daily_combo_tela["is_duvida"].astype(int).sum() / total_registros_daily * 100) if total_registros_daily else 0
+
+                    kpi_d1, kpi_d2, kpi_d3, kpi_d4, kpi_d5 = st.columns(5)
+                    kpi_d1.metric("Total de Horas", f"{total_horas_daily:.1f}h")
+                    kpi_d2.metric("Registros", f"{total_registros_daily}")
+                    kpi_d3.metric(
+                        "Média Horas/Dia", f"{media_horas_dia_daily:.1f}h",
+                        help="Considera só os dias (Ontem/Hoje) em que houve pelo menos 1 registro.",
+                    )
+                    kpi_d4.metric("% Impedimentos", f"{pct_impedimento_daily:.0f}%")
+                    kpi_d5.metric("% Dúvidas", f"{pct_duvida_daily:.0f}%")
+
+                    st.markdown("---")
                     renderizar_toggle_colunas_grafico("daily")
                     c_graf1, c_graf2 = obter_par_colunas_grafico("daily")
                     with c_graf1:
