@@ -2919,9 +2919,11 @@ with tab_manage:
                 # para a página, Anterior, Próximo) numa linha só, depois da
                 # lista -- não mais antes dela. A legenda "Página X de Y"
                 # fica numa linha própria acima, já que não fazia parte do
-                # pedido de "mesma linha" dos 4 controles.
+                # pedido de "mesma linha" dos 4 controles. "Primeira" e
+                # "Última" são 2 botões adicionados depois -- pulam direto
+                # pro início/fim sem precisar digitar o número da página.
                 st.caption(f"Página {st.session_state.current_page} de {total_pages} (Total: {total_records} registros)")
-                col_per_page, col_page_jump, col_prev, col_next = st.columns([1.4, 1.4, 1, 1])
+                col_per_page, col_page_jump, col_first, col_prev, col_next, col_last = st.columns([1.3, 1.3, 1, 1, 1, 1.1])
                 with col_per_page:
                     opcoes_por_pagina = [10, 25, 50, 100]
                     idx_atual = opcoes_por_pagina.index(items_per_page) if items_per_page in opcoes_por_pagina else 1
@@ -2930,10 +2932,16 @@ with tab_manage:
                     )
                 with col_page_jump:
                     jump_page = st.number_input(
-                        "Ir para a página", min_value=1, max_value=total_pages, value=st.session_state.current_page,
+                        f"Ir para a página (1-{total_pages})",
+                        min_value=1, max_value=total_pages, value=st.session_state.current_page,
                     )
                     if jump_page != st.session_state.current_page:
                         st.session_state.current_page = jump_page
+                        st.rerun()
+                with col_first:
+                    st.markdown("<div style='height: 1.8rem'></div>", unsafe_allow_html=True)
+                    if st.button("⏮️ Primeira", disabled=(st.session_state.current_page == 1), use_container_width=True):
+                        st.session_state.current_page = 1
                         st.rerun()
                 with col_prev:
                     st.markdown("<div style='height: 1.8rem'></div>", unsafe_allow_html=True)
@@ -2944,6 +2952,11 @@ with tab_manage:
                     st.markdown("<div style='height: 1.8rem'></div>", unsafe_allow_html=True)
                     if st.button("Próximo ➡️", disabled=(st.session_state.current_page == total_pages), use_container_width=True):
                         st.session_state.current_page += 1
+                        st.rerun()
+                with col_last:
+                    st.markdown("<div style='height: 1.8rem'></div>", unsafe_allow_html=True)
+                    if st.button(f"Última ⏭️ ({total_pages})", disabled=(st.session_state.current_page == total_pages), use_container_width=True):
+                        st.session_state.current_page = total_pages
                         st.rerun()
 
     if st.session_state.view_state == 'add':
