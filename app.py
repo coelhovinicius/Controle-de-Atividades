@@ -746,6 +746,35 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# O PORQUE: pedido do usuário -- ao clicar num selectbox (Projeto,
+# Categoria, etc.) que já tem um valor escolhido e começar a digitar pra
+# filtrar, o texto novo deve SUBSTITUIR o que já estava lá, não ser
+# inserido no meio/final dele. Isso é o próprio componente de selectbox do
+# Streamlit (baseweb) que controla por baixo dos panos -- não tem parâmetro
+# em Python pra isso, por isso o pequeno ajuste aqui.
+# "focusin" (não "focus") porque precisa borbulhar (bubble) pra funcionar
+# com um listener único no document, sem precisar re-anexar a cada
+# selectbox renderizado. O input.select() logo depois do foco marca todo o
+# texto existente, então a primeira tecla digitada já substitui tudo.
+# A guarda "window.__..." evita duplicar o listener a cada rerun do
+# Streamlit (st.html() reinjeta este script em toda execução).
+st.html(
+    """
+    <script>
+    if (!window.__selecionarTextoAoFocarSelectbox) {
+        window.__selecionarTextoAoFocarSelectbox = true;
+        document.addEventListener('focusin', function(evento) {
+            const alvo = evento.target;
+            if (alvo && alvo.tagName === 'INPUT' && alvo.closest('[data-baseweb="select"]')) {
+                setTimeout(function() { alvo.select(); }, 0);
+            }
+        });
+    }
+    </script>
+    """,
+    unsafe_allow_javascript=True,
+)
+
 # O PORQUE: sem um mapa de cores fixo, cada grafico (px.bar, px.pie, px.line)
 # atribui cores automaticamente na ordem em que os valores aparecem nos dados
 # filtrados - por isso "Outros" podia sair azul num grafico e rosa em outro.
@@ -1266,16 +1295,21 @@ def _current_user() -> str:
 
 
 def get_project_options() -> list:
-    # O PORQUE: mantém "Outros" sempre por último (comportamento original),
-    # inserindo os projetos customizados logo antes dele. Cada usuário só vê
+    # O PORQUE: ordem alfabética (A-Z, sem diferenciar maiúscula/minúscula)
+    # pedida pelo usuário -- só "Outros" continua fixo no final, já que é
+    # um catch-all, não um projeto de verdade (faz mais sentido ficar
+    # sempre por último do que respeitar o alfabeto). Cada usuário só vê
     # (e só pode gerenciar) os projetos customizados que ele mesmo criou.
     custom = [p for p in repo.get_custom_options("project", _current_user()) if p not in BASE_PROJECT_OPTIONS]
-    return BASE_PROJECT_OPTIONS[:-1] + custom + [BASE_PROJECT_OPTIONS[-1]]
+    todos_exceto_outros = sorted(BASE_PROJECT_OPTIONS[:-1] + custom, key=str.casefold)
+    return todos_exceto_outros + [BASE_PROJECT_OPTIONS[-1]]
 
 
 def get_category_options() -> list:
+    # O PORQUE: mesma regra de ordem alfabética -- aqui não tem nenhum
+    # "catch-all" tipo "Outros" pra manter fixo, então ordena tudo junto.
     custom = [c for c in repo.get_custom_options("category", _current_user()) if c not in BASE_CATEGORY_OPTIONS]
-    return BASE_CATEGORY_OPTIONS + custom
+    return sorted(BASE_CATEGORY_OPTIONS + custom, key=str.casefold)
 
 
 # ==========================================
@@ -3459,7 +3493,6 @@ if is_admin:
                     file_name=f"daily_{agora_br().strftime('%Y%m%d')}.txt",
                     mime="text/plain",
                     use_container_width=True,
-                    type="primary",
                     disabled=pending_changes,
                 )
             with c_down_graf:
@@ -3471,7 +3504,7 @@ if is_admin:
                 if st.button("📊 Ver Gráficos do Período", use_container_width=True, disabled=pending_changes):
                     st.session_state["daily_mostrar_graficos"] = True
             with c_down_pdf:
-                if st.button("📄 Gerar PDF da Daily", use_container_width=True, disabled=pending_changes):
+                if st.button("📄 Gerar PDF da Daily", type="primary", use_container_width=True, disabled=pending_changes, key="btn_gerar_pdf_daily"):
                     with st.spinner("Montando o PDF..."):
                         df_daily_combo = pd.concat([
                             rep["df_ontem"].assign(Período=f"Ontem ({rep['d_ontem'].strftime('%d/%m')})"),
@@ -4087,7 +4120,7 @@ with tab_dashboard:
                         # reconstruídos com matplotlib a partir de df_filtered (não
                         # são os mesmos objetos Plotly da tela) -- ver justificativa
                         # em gerar_pdf_relatorio().
-                        if st.button("📄 Gerar PDF do Dashboard", use_container_width=True):
+                        if st.button("📄 Gerar PDF do Dashboard", type="primary", use_container_width=True, key="btn_gerar_pdf_dashboard"):
                             with st.spinner("Montando o PDF (isso pode levar alguns segundos)..."):
                                 kpis_pdf = [
                                     (f"{len(df_filtered)}", "Registros"),
