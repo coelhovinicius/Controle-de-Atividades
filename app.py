@@ -3559,13 +3559,39 @@ if is_admin:
                             paragrafos_pdf.append((f"O que fiz ontem ({rep['d_ontem'].strftime('%d/%m/%Y')}): sem registros mapeados.", "Heading4"))
                         if rep["df_hoje"].empty:
                             paragrafos_pdf.append((f"O que farei hoje ({rep['d_hoje'].strftime('%d/%m/%Y')}): sem registros mapeados.", "Heading4"))
-                        if paragrafos_pdf:
-                            paragrafos_pdf.append("")
-                        paragrafos_pdf.append(("Impedimentos:", "Heading4"))
-                        paragrafos_pdf.append(rep['impedimentos'] or "Nenhum.")
-                        paragrafos_pdf.append("")
-                        paragrafos_pdf.append(("Dúvidas:", "Heading4"))
-                        paragrafos_pdf.append(rep['duvidas'] or "Nenhuma.")
+
+                        def _linhas_texto_para_tabela(texto: str, placeholder: str) -> list:
+                            # O PORQUE: antes, Impedimentos/Dúvidas viravam UM
+                            # parágrafo só (Paragraph) -- e o Paragraph do
+                            # reportlab IGNORA quebra de linha simples dentro
+                            # do texto (só reconhece <br/> explícito), então
+                            # cada item lançado como uma linha separada no
+                            # textarea saía tudo grudado, um atrás do outro,
+                            # no PDF. Convertido pra tabela (mesmo mecanismo
+                            # das listas de atividades acima) -- cada linha
+                            # digitada vira sua PRÓPRIA linha de tabela, com
+                            # o "- " do início removido (a própria grade da
+                            # tabela já separa visualmente, o traço fica
+                            # redundante). Sem nenhum item real, mostra uma
+                            # única linha com o placeholder ("Nenhum."/
+                            # "Nenhuma.") -- mantém a mesma aparência
+                            # destacada mesmo quando está vazio.
+                            linhas = [ln.strip().lstrip("- ").strip() for ln in (texto or "").strip().splitlines() if ln.strip()]
+                            linhas = [ln for ln in linhas if ln.lower() != placeholder.lower()]
+                            return [[ln] for ln in linhas] if linhas else [[placeholder]]
+
+                        tabelas_pdf.append((
+                            "Impedimentos",
+                            ["Descrição"],
+                            _linhas_texto_para_tabela(rep['impedimentos'], "Nenhum."),
+                            [_largura_pdf_util],
+                        ))
+                        tabelas_pdf.append((
+                            "Dúvidas",
+                            ["Descrição"],
+                            _linhas_texto_para_tabela(rep['duvidas'], "Nenhuma."),
+                            [_largura_pdf_util],
+                        ))
 
                         # O PORQUE: gráfico "respectivo" pedido -- mostra as horas
                         # do próprio período da Daily (ontem + hoje) por projeto e
