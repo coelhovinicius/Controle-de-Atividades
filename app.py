@@ -577,6 +577,26 @@ st.markdown(
         font-weight: 700;
     }
 
+    /* O PORQUE: links do Azure DevOps colados nas descrições/Impedimentos/
+       Dúvidas são "palavras" enormes sem espaço, e o navegador não tinha
+       onde quebrar a linha. Nas caixas de st.warning/st.success (lado a
+       lado na Daily), o conteúdo é um item flex que nunca fica mais
+       estreito que a sua maior palavra -- então a URL mais longa ditava a
+       largura do texto INTEIRO, e todas as linhas vazavam pra fora da
+       caixa (e por cima da coluna vizinha).
+       - break-word em todo markdown: só quebra uma palavra quando ela
+         sozinha não cabe na linha; não mexe no tamanho mínimo dos
+         elementos, então abas e botões continuam iguais.
+       - anywhere dentro dos alertas: além de quebrar, deixa o tamanho
+         mínimo do conteúdo encolher, que é o que faz o texto voltar a
+         respeitar a largura da caixa. */
+    [data-testid="stMarkdownContainer"] {
+        overflow-wrap: break-word;
+    }
+    [data-testid="stAlert"] [data-testid="stMarkdownContainer"] {
+        overflow-wrap: anywhere;
+    }
+
     /* Teto de largura para telas grandes/ultrawide -- evita conteúdo
        esticado de ponta a ponta; abaixo desse ponto (a maioria dos
        desktops/tablets), o layout continua exatamente como antes. */
