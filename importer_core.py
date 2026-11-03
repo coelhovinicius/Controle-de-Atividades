@@ -112,6 +112,24 @@ def _infer_is_duvida(text: str) -> bool:
 # arquivo quanto para upload.
 _BULLET_RE = re.compile(r'^-+\s*')
 
+# O PORQUE: marcadores de lista que aparecem no texto do Diário -- "-" do
+# item principal e "○"/"•"/"▪" dos subitens que o OneNote gera ao colar.
+_LINE_BULLET_RE = re.compile(r'^[-–•○◦▪*]+\s*')
+
+# O PORQUE: linhas que o parser ignora (sobras de cópia do OneNote/Azure).
+_SKIP_PREFIXES = ("---", "AZURE BOARDS", "BACKLOG")
+
+
+def match_date_header(line: str):
+    """Devolve a data (dd/mm/aaaa) se a linha (já sem espaços nas pontas)
+    for um cabeçalho de dia, senão None. Mesma regra para todos os leitores
+    de texto: uma data numa linha curta (<= 30 caracteres) abre um novo dia
+    -- uma data no meio de uma descrição longa não conta."""
+    date_match = re.search(r'\b(\d{2}/\d{2}/\d{4})\b', line)
+    if date_match and len(line) <= 30:
+        return date_match.group(1)
+    return None
+
 
 class HistoryParser:
     def __init__(self, file_path: str = "raw_history.txt"):
@@ -166,16 +184,15 @@ class HistoryParser:
 
         for raw_line in raw_text.splitlines():
             line = raw_line.strip()
-            if not line or line.startswith("---") or line.startswith("AZURE BOARDS") or line.startswith("BACKLOG"):
+            if not line or line.startswith(_SKIP_PREFIXES):
                 continue
 
-            date_match = re.search(r'\b(\d{2}/\d{2}/\d{4})\b', line)
+            raw_date = match_date_header(line)
 
-            if date_match and len(line) <= 30:
+            if raw_date:
                 self._flush_buffer(current_date_iso, current_task_buffer, parsed_records)
                 current_task_buffer.clear()
 
-                raw_date = date_match.group(1)
                 current_date_iso = self._parse_date(raw_date)
 
                 inline_text = line.replace(raw_date, "").strip(" :-.")
@@ -196,6 +213,108 @@ class HistoryParser:
 
         df_parsed = pd.DataFrame(parsed_records, columns=["log_date", "project", "category", "description", "effort_hours", "is_impedimento", "is_duvida"])
         return df_parsed
+
+    def parse_text_por_linha(self, raw_text: str) -> pd.DataFrame:
+        # O PORQUE: leitor usado pelo Diário. Diferente de parse_text() (que
+        # só fecha uma tarefa quando a linha termina em ";" ou "." e cola o
+        # resto na tarefa anterior), aqui CADA LINHA é uma tarefa -- quem
+        # digita direto no app não precisa lembrar do ";". parse_text() fica
+        # intacto de propósito: a Sincronização compara descrições exatas
+        # com o banco, e mudar o jeito de ler mudaria essas descrições.
+        #
+        # Linha terminada em ":" vira prefixo dos subitens logo abaixo
+        # (formato que o OneNote gera ao colar):
+        #     - Testes Vale Presente homolog:
+        #         ○ CDT;
+        #         ○ Não-CDT;
+        # vira "Testes Vale Presente homolog: CDT" e "...: Não-CDT". O
+        # prefixo vale até a próxima linha em branco, o próximo item "-" ou
+        # a próxima data; se não vier nenhum subitem, o cabeçalho vira uma
+        # tarefa sozinho.
+        parsed_records = []
+        current_date_iso = None
+        tasks = []
+        prefix = None
+        prefix_used = False
+
+        def close_prefix():
+            nonlocal prefix, prefix_used
+            if prefix and not prefix_used:
+                tasks.append(prefix)
+            prefix, prefix_used = None, False
+
+        for raw_line in raw_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                close_prefix()
+                continue
+            if line.startswith(_SKIP_PREFIXES):
+                continue
+
+            raw_date = match_date_header(line)
+            if raw_date:
+                close_prefix()
+                self._flush_buffer(current_date_iso, tasks, parsed_records)
+                tasks.clear()
+                current_date_iso = self._parse_date(raw_date)
+                inline_text = line.replace(raw_date, "").strip(" :-.")
+                if inline_text:
+                    tasks.append(inline_text)
+                continue
+
+            if not current_date_iso:
+                continue
+
+            is_top_level = line.startswith(("-", "–"))
+            text = _LINE_BULLET_RE.sub("", line).strip().rstrip(";.").strip()
+            if not text:
+                continue
+
+            if text.endswith(":"):
+                close_prefix()
+                prefix = text.rstrip(":").strip()
+                continue
+
+            if prefix and not is_top_level:
+                tasks.append(f"{prefix}: {text}")
+                prefix_used = True
+                continue
+
+            close_prefix()
+            tasks.append(text)
+
+        close_prefix()
+        self._flush_buffer(current_date_iso, tasks, parsed_records)
+
+        return pd.DataFrame(parsed_records, columns=["log_date", "project", "category", "description", "effort_hours", "is_impedimento", "is_duvida"])
+
+    @staticmethod
+    def split_text_by_date(raw_text: str) -> dict:
+        """Separa o texto em {"YYYY-MM-DD": texto do dia}, preservando as
+        linhas como foram escritas (é o que vai para o caderno do Diário).
+        Usa a mesma regra de cabeçalho de data dos leitores acima; texto
+        antes da primeira data é ignorado. Se a mesma data aparecer duas
+        vezes, os trechos são juntados."""
+        days = {}
+        current_date_iso = None
+        for raw_line in raw_text.splitlines():
+            line = raw_line.strip()
+            raw_date = match_date_header(line) if line else None
+            if raw_date:
+                try:
+                    current_date_iso = datetime.strptime(raw_date, "%d/%m/%Y").strftime("%Y-%m-%d")
+                except ValueError:
+                    current_date_iso = None
+                    continue
+                days.setdefault(current_date_iso, [])
+                inline_text = line.replace(raw_date, "").strip(" :-.")
+                if inline_text:
+                    days[current_date_iso].append(inline_text)
+                continue
+            if current_date_iso:
+                days[current_date_iso].append(raw_line.rstrip())
+
+        return {d: "\n".join(lines).strip("\n") for d, lines in days.items() if "\n".join(lines).strip()}
 
     def _flush_buffer(self, date_iso: str, tasks: list, record_list: list):
         if not date_iso or not tasks:

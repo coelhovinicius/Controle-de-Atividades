@@ -244,6 +244,26 @@ class LogRepository:
         );
         """
         self.conn.execute(query_user_settings)
+
+        # O PORQUE: tabela do "Diário" -- guarda o texto livre de cada dia,
+        # do jeito que foi escrito (o que antes ficava só no OneNote). Os
+        # registros em work_logs são DERIVADOS desse texto (via IA), mas o
+        # texto original continua aqui para consulta/busca, mesmo que uma
+        # linha tenha sido descartada na revisão. 1 anotação por dia por
+        # usuário (UNIQUE) -- escrever o mesmo dia de novo acrescenta ao
+        # texto existente em vez de criar outra linha.
+        query_daily_notes = """
+        CREATE TABLE IF NOT EXISTS daily_notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            note_date DATE NOT NULL,
+            content TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(username, note_date)
+        );
+        """
+        self.conn.execute(query_daily_notes)
         self.conn.commit()
 
     def get_banco_horas_saldo_inicial(self, username: str) -> float:
@@ -436,6 +456,68 @@ class LogRepository:
         except Exception:
             columns = WORK_LOGS_COLUMNS
         return pd.DataFrame(rows, columns=columns)
+
+    # ==========================================
+    # DIÁRIO (anotações livres por dia)
+    # ==========================================
+    DAILY_NOTES_COLUMNS = ["id", "username", "note_date", "content", "created_at", "updated_at"]
+
+    def save_daily_notes_bulk(self, username: str, notes: dict, mode: str = "append") -> int:
+        # O PORQUE: `notes` é {"YYYY-MM-DD": "texto do dia"}. O que fazer
+        # quando o dia JÁ tem anotação depende de quem chama:
+        #   - "append": acrescenta ao texto existente -- escrever o mesmo dia
+        #     em duas vezes (manhã/tarde) pelo Diário. Se o texto novo já
+        #     estiver contido no antigo (salvou duas vezes o mesmo texto),
+        #     não duplica.
+        #   - "replace": substitui o texto -- edição pelo Caderno.
+        #   - "skip": mantém o que já existe -- importação do histórico do
+        #     OneNote (nunca apaga o que foi escrito no Diário, e rodar a
+        #     importação duas vezes não muda nada).
+        # 1 executemany + 1 commit, mesmo raciocínio de insert_logs_bulk (Turso).
+        notes = {d: (t or "").strip() for d, t in notes.items() if (t or "").strip()}
+        if not notes:
+            return 0
+        if mode == "skip":
+            on_conflict = "DO NOTHING"
+        elif mode == "replace":
+            on_conflict = "DO UPDATE SET content = excluded.content, updated_at = CURRENT_TIMESTAMP"
+        else:
+            on_conflict = (
+                "DO UPDATE SET content = CASE WHEN instr(daily_notes.content, excluded.content) > 0 "
+                "THEN daily_notes.content "
+                "ELSE daily_notes.content || char(10) || char(10) || excluded.content END, "
+                "updated_at = CURRENT_TIMESTAMP"
+            )
+        query = (
+            "INSERT INTO daily_notes (username, note_date, content) VALUES (?, ?, ?) "
+            f"ON CONFLICT(username, note_date) {on_conflict}"
+        )
+        self.conn.executemany(query, [(username, d, t) for d, t in notes.items()])
+        self.conn.commit()
+        return len(notes)
+
+    def get_daily_notes_as_dataframe(self, username: str, start_date: str = None, end_date: str = None) -> pd.DataFrame:
+        # O PORQUE: sem período = histórico inteiro (usado pela busca em
+        # "todo o histórico" do Caderno). A busca por texto é feita depois,
+        # em pandas, para ignorar acentos/maiúsculas do mesmo jeito que a
+        # busca da aba Registro de Atividades.
+        query = "SELECT * FROM daily_notes WHERE username = ?"
+        params = [username]
+        if start_date and end_date:
+            query += " AND note_date >= ? AND note_date <= ?"
+            params += [start_date, end_date]
+        query += " ORDER BY note_date DESC"
+        cursor = self.conn.execute(query, tuple(params))
+        rows = cursor.fetchall()
+        try:
+            columns = [d[0] for d in cursor.description]
+        except Exception:
+            columns = self.DAILY_NOTES_COLUMNS
+        return pd.DataFrame(rows, columns=columns)
+
+    def delete_daily_note(self, username: str, note_date: str):
+        self.conn.execute("DELETE FROM daily_notes WHERE username = ? AND note_date = ?", (username, note_date))
+        self.conn.commit()
 
     # ==========================================
     # SOLICITAÇÕES DE ACESSO DE CONVIDADO
