@@ -38,13 +38,26 @@ st.set_page_config(page_title="Task Tracker ", layout="wide", initial_sidebar_st
 # do Streamlit Cloud. Localmente, sem REQUIRE_TURSO configurado (o padrão),
 # nada disto muda o comportamento de sempre.
 @st.cache_resource
-def get_repository():
+def get_repository(versao_codigo: str):
     db_conn = DatabaseConnection()
     return LogRepository(db_conn)
 
 
+def _versao_codigo_banco() -> str:
+    # O PORQUE: @st.cache_resource só recria o objeto quando muda o código de
+    # get_repository() ou um argumento dela -- mudar database_core.py não
+    # conta. Como um deploy no Streamlit Cloud não reinicia o processo, o app
+    # continuava com o LogRepository antigo (sem os métodos novos e sem rodar
+    # _initialize_database() para criar tabelas novas) até um reboot manual.
+    # Com o hash do arquivo como argumento, todo deploy que mexe no banco
+    # ganha um repositório novo.
+    caminho = os.path.join(os.path.dirname(os.path.abspath(__file__)), "database_core.py")
+    with open(caminho, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
 try:
-    repo = get_repository()
+    repo = get_repository(_versao_codigo_banco())
 except TursoRequiredError as e:
     st.title("📊 Task Tracker")
     st.error(
@@ -2027,7 +2040,7 @@ def reset_add_form_stay():
     # formulário (igual reset_states faria), MAS mantém view_state='add',
     # pra continuar na tela de registro em vez de voltar pra listagem. Só é
     # seguro chamar isso durante o bloqueio de tela cheia (dentro do
-    # dispatcher, com processing=True) -- é o único momento em que os
+    # dispatcher) -- é o único momento em que os
     # widgets do formulário ainda não foram desenhados nesta execução, e
     # portanto ainda é permitido escrever nas keys deles.
     st.session_state.confirm_state = None
@@ -2386,7 +2399,9 @@ def execute_processing_action(action: dict) -> bool:
 
     elif t == "diario_gerar":
         resultado = preparar_registros_diario(p["texto"], p["data"], username)
-        if resultado["df"].empty and resultado["ja_existentes"].empty:
+        # O PORQUE: um texto só com anotações depois de "---" não gera tarefa,
+        # mas ainda tem o que guardar no Caderno -- só falha se não houver nada.
+        if resultado["df"].empty and resultado["ja_existentes"].empty and not resultado["notas"]:
             action["failure_message"] = "Nenhuma tarefa encontrada no texto."
             return False
         st.session_state.diario_resultado = resultado
@@ -2427,8 +2442,11 @@ def execute_processing_action(action: dict) -> bool:
                     "is_impedimento": bool(row.get("is_impedimento", False)),
                     "is_duvida": bool(row.get("is_duvida", False)),
                 })
-        qtd = repo.insert_logs_bulk(username, rows_to_insert)
+        # O PORQUE: a anotação vem primeiro porque é seguro repeti-la (o modo
+        # "append" não duplica texto), e os registros não são. Se a anotação
+        # falhar, nenhum registro foi gravado e dá para salvar de novo.
         qtd_notas = repo.save_daily_notes_bulk(username, p["notas"], mode="append")
+        qtd = repo.insert_logs_bulk(username, rows_to_insert)
         st.session_state.diario_resultado = None
         # O PORQUE: seguro escrever na key do text_area aqui -- o dispatcher
         # roda antes de qualquer widget desta execução ser desenhado.
@@ -2465,9 +2483,12 @@ if st.session_state.processing:
     # clicados.
     action = st.session_state.processing_action
     render_processing_overlay(action.get("processing_message", "Processando..."))
-    ok = execute_processing_action(action)
+    # O PORQUE: zera o estado ANTES de executar. Se a ação der exceção, o
+    # script para aqui; com o estado ainda ligado, o próximo rerun executaria
+    # a mesma ação de novo -- e uma que já gravou algo gravaria em dobro.
     st.session_state.processing = False
     st.session_state.processing_action = None
+    ok = execute_processing_action(action)
     if ok:
         st.toast(action["success_message"], icon="✅")
     else:
@@ -3414,8 +3435,9 @@ def _render_diario_escrever():
         st.markdown("<div style='height: 1.8rem'></div>", unsafe_allow_html=True)
         st.caption(
             "Vários dias de uma vez: comece cada dia com a data (ex.: `03/11/2026:`). Linha terminada "
-            "em `:` vira prefixo dos subitens abaixo dela. Escreva `OVERTIME` em qualquer linha para o "
-            "dia não ser fechado em 8h."
+            "em `:` vira prefixo dos subitens abaixo dela. Depois de uma linha `---`, o resto do dia fica "
+            "só no Caderno, sem virar registro. Escreva `OVERTIME` em qualquer linha para o dia não ser "
+            "fechado em 8h."
         )
 
     texto = st.text_area(
