@@ -24,6 +24,28 @@ internet (Streamlit Community Cloud).
 - Sugestão de duração/projeto/categoria por IA no formulário manual (botão
   "🤖 Sugerir com IA").
 
+### Diário (substitui o OneNote)
+- **✍️ Escrever o dia**: texto livre, uma tarefa por linha, do mesmo jeito
+  que era escrito no OneNote. Vários dias de uma vez: comece cada dia com a
+  data (`dd/mm/aaaa:`). Linha terminada em `:` vira prefixo dos subitens
+  logo abaixo (ex.: `Testes Vale Presente:` + `○ CDT` → "Testes Vale
+  Presente: CDT").
+- **🤖 Gerar registros**: a IA estima o tempo e classifica projeto/categoria
+  de cada linha e fecha o dia em 8h, **descontando o que já está salvo
+  naquele dia** (dá pra lançar o dia em mais de uma vez). Sem IA
+  configurada, divide igualmente o que falta para 8h.
+- Linhas que já existem (mesmo dia + mesma descrição, ignorando
+  acentos/maiúsculas) são ignoradas -- colar o mesmo texto duas vezes não
+  duplica nada.
+- Revisão numa tabela totalmente editável antes de salvar. **Só insere,
+  nunca apaga** (diferente da Sincronização).
+- **📖 Caderno**: o texto de cada dia fica guardado como foi escrito, com
+  busca por período e por palavra (ignora acentos) e edição. Editar uma
+  anotação não altera os registros.
+- **Importar histórico do OneNote**: no Caderno, envie um `.txt` no formato
+  `dd/mm/aaaa:` + tarefas -- cada dia vira uma anotação (dias que já têm
+  anotação são mantidos; nenhum registro é criado).
+
 ### Daily Scrum
 - Escolha de período (ontem/hoje), sugestão automática de
   impedimentos/dúvidas a partir dos registros marcados.
@@ -49,6 +71,10 @@ internet (Streamlit Community Cloud).
   inserir ou excluir, com revisão e confirmação antes de aplicar.
 - Estimativa de esforço e classificação de projeto/categoria por IA nos
   registros novos, se configurada (ver seção IA abaixo).
+- ⚠️ A Sincronização **espelha** o arquivo: o que está salvo e não está no
+  arquivo é proposto para remoção. Registros lançados pelo Diário não estão
+  em nenhum arquivo -- se usar a Sincronização depois de adotar o Diário,
+  desmarque-os na lista de remoção.
 
 ### IA (opcional)
 Integração com um workflow do [n8n](https://n8n.io) próprio (não usa API

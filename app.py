@@ -9,6 +9,7 @@ import time
 import os
 import sys
 import io
+import html
 import hmac
 import base64
 import hashlib
@@ -1399,7 +1400,8 @@ def compute_overtime_days(df: pd.DataFrame) -> set:
     return overtime_days
 
 
-def normalizar_horas_por_dia(df: pd.DataFrame, overtime_days: set, target_hours: float = 8.0) -> pd.DataFrame:
+def normalizar_horas_por_dia(df: pd.DataFrame, overtime_days: set, target_hours: float = 8.0,
+                             horas_ja_salvas: dict = None) -> pd.DataFrame:
     """
     Para cada dia que NÃO estiver em overtime_days, reescala effort_hours
     proporcionalmente para que a soma do dia bata em target_hours -- mantém
@@ -1410,22 +1412,32 @@ def normalizar_horas_por_dia(df: pd.DataFrame, overtime_days: set, target_hours:
     variam demais (de 30min a 9h a mais) pra qualquer regra fixa fazer
     sentido; a soma crua da estimativa de cada tarefa é o que reflete a
     realidade.
+
+    horas_ja_salvas ({"YYYY-MM-DD": horas}) desconta do alvo o que já está
+    gravado naquele dia -- usado pelo Diário, quando o dia é lançado em
+    mais de uma vez: as linhas novas preenchem só o que falta para 8h. Se o
+    dia já tiver 8h ou mais salvas, as linhas novas ficam com a estimativa
+    crua.
     """
     df = df.copy()
     if df.empty or "log_date" not in df.columns:
         return df
+    horas_ja_salvas = horas_ja_salvas or {}
     for log_date, group_idx in df.groupby("log_date").groups.items():
         if log_date in overtime_days:
             continue
         total = df.loc[group_idx, "effort_hours"].sum()
         if total <= 0:
             continue
-        factor = target_hours / total
+        alvo = target_hours - horas_ja_salvas.get(log_date, 0.0)
+        if alvo <= 0:
+            continue
+        factor = alvo / total
         df.loc[group_idx, "effort_hours"] = (df.loc[group_idx, "effort_hours"] * factor).round(2)
     return df
 
 
-def aplicar_estimativa_ia_e_normalizacao(df_to_insert: pd.DataFrame) -> tuple:
+def aplicar_estimativa_ia_e_normalizacao(df_to_insert: pd.DataFrame, df_ja_salvos: pd.DataFrame = None) -> tuple:
     """
     Função de alto nível que orquestra: chamar a IA (via n8n) para estimar
     duração + classificar projeto/categoria de cada linha de df_to_insert,
@@ -1437,6 +1449,10 @@ def aplicar_estimativa_ia_e_normalizacao(df_to_insert: pd.DataFrame) -> tuple:
     'aviso' é None em caso de sucesso, ou uma string explicando por que a
     estimativa por IA não foi aplicada (nesse caso, df_atualizado volta
     IGUAL ao que entrou, sem nenhuma mudança -- comportamento anterior).
+
+    df_ja_salvos (opcional, usado pelo Diário): registros já gravados nos
+    mesmos dias -- entram na detecção de OVERTIME e no desconto das horas
+    já lançadas (ver normalizar_horas_por_dia).
     """
     if df_to_insert.empty:
         return df_to_insert, [], [], None
@@ -1471,10 +1487,24 @@ def aplicar_estimativa_ia_e_normalizacao(df_to_insert: pd.DataFrame) -> tuple:
             if r.get("is_new_category"):
                 novas_categorias.add(category)
 
-    overtime_days = compute_overtime_days(df)
-    df = normalizar_horas_por_dia(df, overtime_days)
+    overtime_days, horas_ja_salvas = _contexto_dias_ja_salvos(df, df_ja_salvos)
+    df = normalizar_horas_por_dia(df, overtime_days, horas_ja_salvas=horas_ja_salvas)
 
     return df, sorted(novos_projetos), sorted(novas_categorias), None
+
+
+def _contexto_dias_ja_salvos(df_novos: pd.DataFrame, df_ja_salvos: pd.DataFrame = None) -> tuple:
+    # O PORQUE: dias de OVERTIME consideram também o que já está salvo (a
+    # palavra pode ter sido escrita no primeiro lançamento do dia), e as
+    # horas já salvas por dia alimentam o desconto da normalização. Sem
+    # df_ja_salvos, é exatamente o comportamento anterior.
+    if df_ja_salvos is None or df_ja_salvos.empty:
+        return compute_overtime_days(df_novos), None
+    ja_salvos = df_ja_salvos[["log_date", "description", "effort_hours"]].copy()
+    ja_salvos["log_date"] = ja_salvos["log_date"].astype(str).str[:10]
+    overtime_days = compute_overtime_days(pd.concat([df_novos[["log_date", "description"]], ja_salvos[["log_date", "description"]]]))
+    horas_ja_salvas = ja_salvos.groupby("log_date")["effort_hours"].sum().to_dict()
+    return overtime_days, horas_ja_salvas
 
 
 def recalcular_esforco_periodo_com_ia(username: str, start_date, end_date):
@@ -1522,6 +1552,74 @@ def recalcular_esforco_periodo_com_ia(username: str, start_date, end_date):
     ]
     qtd = repo.update_logs_bulk(username, updates)
     return qtd, novos_projetos, novas_categorias, None
+
+
+# ==========================================
+# DIÁRIO (texto livre -> registros, via IA)
+# ==========================================
+def _chave_descricao(texto) -> str:
+    # O PORQUE: compara descrições ignorando acentos, maiúsculas e espaços
+    # nas pontas -- "Reunião X" salvo ontem e "reuniao x" colado hoje são a
+    # mesma tarefa. (remove_accents() só é definida mais abaixo no arquivo,
+    # depois do dispatcher que chama esta função -- por isso a versão local.)
+    nfkd = unicodedata.normalize("NFKD", str(texto))
+    return "".join(c for c in nfkd if not unicodedata.combining(c)).strip().lower()
+
+
+def preparar_registros_diario(texto: str, data_padrao, username: str) -> dict:
+    """
+    Transforma o texto do Diário em registros prontos para revisão:
+    leitura linha a linha, descarte do que já está salvo (mesmo dia + mesma
+    descrição), estimativa/classificação por IA e fechamento do dia em 8h
+    descontando o que já foi lançado naquele dia.
+
+    Linhas antes de qualquer data caem em `data_padrao` (o dia escolhido na
+    tela); datas escritas no texto (dd/mm/aaaa:) abrem outros dias.
+
+    Retorna dict com: df (novos registros), notas ({data: texto}),
+    ja_existentes (linhas ignoradas por já estarem salvas), horas_ja_salvas
+    ({data: horas}), ia_aviso, novos_projetos, novas_categorias.
+    """
+    texto_completo = f"{data_padrao.strftime('%d/%m/%Y')}:\n{texto}"
+    parser = HistoryParser()
+    df = parser.parse_text_por_linha(texto_completo)
+    notas = HistoryParser.split_text_by_date(texto_completo)
+    resultado = {
+        "df": df, "notas": notas, "ja_existentes": pd.DataFrame(), "horas_ja_salvas": {},
+        "ia_aviso": None, "novos_projetos": [], "novas_categorias": [],
+    }
+    if df.empty:
+        return resultado
+
+    datas = sorted(df["log_date"].unique())
+    df_salvos = repo.get_logs_as_dataframe_by_range(username, datas[0], datas[-1])
+    if not df_salvos.empty:
+        df_salvos["log_date"] = df_salvos["log_date"].astype(str).str[:10]
+        df_salvos = df_salvos[df_salvos["log_date"].isin(datas)]
+        resultado["horas_ja_salvas"] = df_salvos.groupby("log_date")["effort_hours"].sum().to_dict()
+
+    chaves_salvas = set(zip(df_salvos["log_date"], df_salvos["description"].map(_chave_descricao))) if not df_salvos.empty else set()
+    ja_existe = [(d, _chave_descricao(desc)) in chaves_salvas for d, desc in zip(df["log_date"], df["description"])]
+    ja_existe = pd.Series(ja_existe, index=df.index)
+    resultado["ja_existentes"] = df[ja_existe].reset_index(drop=True)
+    df_novos = df[~ja_existe].reset_index(drop=True)
+
+    if not df_novos.empty:
+        if N8N_AI_ESTIMATE_WEBHOOK_URL:
+            df_novos, novos_p, novas_c, ia_aviso = aplicar_estimativa_ia_e_normalizacao(df_novos, df_ja_salvos=df_salvos)
+            resultado.update(novos_projetos=novos_p, novas_categorias=novas_c, ia_aviso=ia_aviso)
+        else:
+            resultado["ia_aviso"] = "N8N_AI_ESTIMATE_WEBHOOK_URL não configurado nos Secrets"
+        if resultado["ia_aviso"]:
+            # O PORQUE: sem IA, cada linha vem com 1h fixa -- em vez de deixar
+            # assim (um dia de 12 linhas viraria 12h), divide igualmente o que
+            # falta para 8h naquele dia. É só um ponto de partida para a
+            # revisão; a estimativa de verdade depende da IA.
+            overtime_days, horas_ja_salvas = _contexto_dias_ja_salvos(df_novos, df_salvos)
+            df_novos = normalizar_horas_por_dia(df_novos, overtime_days, horas_ja_salvas=horas_ja_salvas)
+
+    resultado["df"] = df_novos
+    return resultado
 
 
 @st.dialog("Recalcular Esforço com IA")
@@ -1889,6 +1987,14 @@ if 'processing' not in st.session_state:
     st.session_state.processing = False
 if 'processing_action' not in st.session_state:
     st.session_state.processing_action = None
+# O PORQUE: estado da revisão do Diário -- 'diario_resultado' guarda o que
+# preparar_registros_diario() devolveu (None = nada gerado ainda), e
+# 'diario_geracao' entra na key do data_editor: cada geração nova ganha um
+# editor "zerado", sem herdar edições feitas na revisão anterior.
+if 'diario_resultado' not in st.session_state:
+    st.session_state.diario_resultado = None
+if 'diario_geracao' not in st.session_state:
+    st.session_state.diario_geracao = 0
 
 # O PORQUE: mapeia o rótulo exibido no cabeçalho para o nome real da coluna
 # no DataFrame, usado tanto para renderizar o botão quanto para ordenar.
@@ -2276,6 +2382,77 @@ def execute_processing_action(action: dict) -> bool:
 
         st.session_state.sync_analyzed = False
         action["success_message"] = f"Prontinho! {records_inserted} registro(s) adicionado(s) e {records_deleted} removido(s)."
+        return True
+
+    elif t == "diario_gerar":
+        resultado = preparar_registros_diario(p["texto"], p["data"], username)
+        if resultado["df"].empty and resultado["ja_existentes"].empty:
+            action["failure_message"] = "Nenhuma tarefa encontrada no texto."
+            return False
+        st.session_state.diario_resultado = resultado
+        st.session_state.diario_geracao += 1
+        return True
+
+    elif t == "diario_salvar":
+        # O PORQUE: só INSERE (nunca apaga nada) -- diferente da
+        # Sincronização, que espelha um arquivo inteiro. Projeto/categoria
+        # que não existiam (sugeridos pela IA ou digitados na revisão) são
+        # cadastrados aqui, só para as linhas que de fato foram salvas.
+        edited = p["edited"]
+        rows_to_insert = []
+        if not edited.empty:
+            projetos_conhecidos = set(get_project_options())
+            categorias_conhecidas = set(get_category_options())
+            for _, row in edited[edited["_Aplicar"] == True].iterrows():
+                descricao = str(row["description"]).strip() if pd.notna(row["description"]) else ""
+                if not descricao or pd.isna(row["log_date"]):
+                    continue
+                log_date_iso = row["log_date"].strftime("%Y-%m-%d") if hasattr(row["log_date"], "strftime") else str(row["log_date"])[:10]
+                projeto = str(row["project"]).strip() if pd.notna(row["project"]) and str(row["project"]).strip() else "Outros"
+                categoria = str(row["category"]).strip() if pd.notna(row["category"]) and str(row["category"]).strip() else "Outros"
+                # O PORQUE: "Outros" é o "não classificado" do leitor por
+                # palavra-chave (sem IA) -- não vira opção cadastrada.
+                if projeto not in projetos_conhecidos and projeto != "Outros":
+                    repo.add_custom_option("project", username, projeto)
+                    projetos_conhecidos.add(projeto)
+                if categoria not in categorias_conhecidas and categoria != "Outros":
+                    repo.add_custom_option("category", username, categoria)
+                    categorias_conhecidas.add(categoria)
+                rows_to_insert.append({
+                    "log_date": log_date_iso,
+                    "project": projeto,
+                    "category": categoria,
+                    "description": descricao,
+                    "effort_hours": float(row["effort_hours"]) if pd.notna(row["effort_hours"]) else 0.0,
+                    "is_impedimento": bool(row.get("is_impedimento", False)),
+                    "is_duvida": bool(row.get("is_duvida", False)),
+                })
+        qtd = repo.insert_logs_bulk(username, rows_to_insert)
+        qtd_notas = repo.save_daily_notes_bulk(username, p["notas"], mode="append")
+        st.session_state.diario_resultado = None
+        # O PORQUE: seguro escrever na key do text_area aqui -- o dispatcher
+        # roda antes de qualquer widget desta execução ser desenhado.
+        st.session_state["diario_texto"] = ""
+        action["success_message"] = f"Diário salvo: {qtd} registro(s) e {qtd_notas} dia(s) no Caderno."
+        return True
+
+    elif t == "caderno_salvar_nota":
+        if p["texto"].strip():
+            repo.save_daily_notes_bulk(username, {p["data"]: p["texto"]}, mode="replace")
+        else:
+            repo.delete_daily_note(username, p["data"])
+        st.session_state.pop("caderno_editando", None)
+        return True
+
+    elif t == "caderno_importar":
+        notas = p["notas"]
+        datas_existentes = set(repo.get_daily_notes_as_dataframe(username)["note_date"].astype(str).str[:10])
+        novas = {d: txt for d, txt in notas.items() if d not in datas_existentes}
+        repo.save_daily_notes_bulk(username, novas, mode="skip")
+        action["success_message"] = (
+            f"{len(novas)} dia(s) importado(s) para o Caderno"
+            + (f"; {len(notas) - len(novas)} já tinham anotação e foram mantidos." if len(notas) > len(novas) else ".")
+        )
         return True
 
     return True
@@ -2682,15 +2859,16 @@ if is_admin and st.session_state.get("mostrar_banco_horas"):
     st.stop()
 
 if is_admin:
-    tab_manage, tab_daily, tab_dashboard, tab_sync = st.tabs(
-        ["Registro de Atividades", "Daily Scrum", "Dashboard & Relatórios", "Sincronização de Arquivo"]
+    tab_manage, tab_diario, tab_daily, tab_dashboard, tab_sync = st.tabs(
+        ["Registro de Atividades", "Diário", "Daily Scrum", "Dashboard & Relatórios", "Sincronização de Arquivo"]
     )
 else:
     # O PORQUE: convidado só vê visualização -- registro (somente leitura) e
-    # dashboard. Daily Scrum e Sincronização são ferramentas de trabalho do
-    # dono da conta, sem sentido (e sem permissão) para quem só está
-    # consultando.
+    # dashboard. Diário, Daily Scrum e Sincronização são ferramentas de
+    # trabalho do dono da conta, sem sentido (e sem permissão) para quem só
+    # está consultando -- o Diário, em especial, guarda anotações pessoais.
     tab_manage, tab_dashboard = st.tabs(["Registro de Atividades", "Dashboard & Relatórios"])
+    tab_diario = None
     tab_daily = None
     tab_sync = None
 
@@ -3199,6 +3377,307 @@ with tab_manage:
         if btn_canc:
             st.session_state.confirm_state = 'cancel_edit'
             st.rerun()
+
+# ==========================================
+# TAB: DIÁRIO (substitui o OneNote)
+# ==========================================
+DIAS_DA_SEMANA_PTBR = ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo"]
+
+# O PORQUE: o Caderno desenha um expander por dia -- com o histórico inteiro
+# (300+ dias) numa busca ampla, a tela ficaria pesada. Mostra os mais
+# recentes e pede pra refinar o filtro.
+CADERNO_LIMITE_DIAS = 60
+
+
+def _decodificar_txt(raw_bytes: bytes) -> str:
+    # O PORQUE: um .txt salvo pelo Bloco de Notas pode vir em UTF-8 (com ou
+    # sem BOM) ou no padrão antigo do Windows (cp1252) -- decodificar tudo
+    # como UTF-8 estragaria os acentos no segundo caso.
+    try:
+        return raw_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw_bytes.decode("cp1252", errors="replace")
+
+
+def _render_diario_escrever():
+    st.header("Diário")
+    st.caption(
+        "Escreva o seu dia como fazia no OneNote, uma tarefa por linha. Ao gerar os registros, a IA "
+        "estima o tempo de cada tarefa, classifica projeto/categoria e fecha o dia em 8h -- você revisa "
+        "tudo antes de salvar. O texto fica guardado no Caderno."
+    )
+
+    col_data, col_dica = st.columns([1, 3])
+    with col_data:
+        data_padrao = st.date_input("Dia", value=agora_br().date(), format="DD/MM/YYYY", key="diario_data")
+    with col_dica:
+        st.markdown("<div style='height: 1.8rem'></div>", unsafe_allow_html=True)
+        st.caption(
+            "Vários dias de uma vez: comece cada dia com a data (ex.: `03/11/2026:`). Linha terminada "
+            "em `:` vira prefixo dos subitens abaixo dela. Escreva `OVERTIME` em qualquer linha para o "
+            "dia não ser fechado em 8h."
+        )
+
+    texto = st.text_area(
+        "Anotações",
+        key="diario_texto",
+        height=280,
+        placeholder=(
+            "- Daily Passaporte\n"
+            "- Testes do checkout em homologação\n"
+            "- Reunião de alinhamento com o time de Vagas:\n"
+            "    ○ regras de negócio\n"
+            "    ○ prazos da sprint"
+        ),
+    )
+
+    if not N8N_AI_ESTIMATE_WEBHOOK_URL:
+        st.caption(
+            "⚠️ IA desligada (`N8N_AI_ESTIMATE_WEBHOOK_URL` não configurado): as horas do dia serão "
+            "divididas igualmente e a classificação será por palavra-chave."
+        )
+
+    # O PORQUE: o botão não fica desabilitado com o texto vazio de propósito
+    # -- o st.text_area só atualiza o valor quando perde o foco, então um
+    # "disabled" calculado a partir dele travaria justamente o clique logo
+    # depois de digitar. A validação acontece no clique.
+    if st.button("🤖 Gerar registros", type="primary", key="diario_btn_gerar"):
+        if not texto.strip():
+            st.warning("Escreva pelo menos uma tarefa antes de gerar os registros.")
+        else:
+            run_blocking_action(
+                "diario_gerar",
+                {"texto": texto, "data": data_padrao},
+                processing_message="Lendo o texto e consultando a IA...",
+                success_message="Registros gerados -- revise abaixo antes de salvar.",
+                failure_message="Nenhuma tarefa encontrada no texto.",
+            )
+
+    resultado = st.session_state.diario_resultado
+    if resultado is None:
+        return
+
+    st.markdown("---")
+    st.subheader("Revisão")
+
+    df_rev = resultado["df"]
+    if resultado["ia_aviso"]:
+        st.warning(
+            f"⚠️ Sem estimativa por IA desta vez ({resultado['ia_aviso']}). As horas abaixo dividem "
+            "igualmente o que falta para 8h em cada dia, e projeto/categoria vêm por palavra-chave -- "
+            "ajuste o que precisar."
+        )
+    elif resultado["novos_projetos"] or resultado["novas_categorias"]:
+        novos = resultado["novos_projetos"] + resultado["novas_categorias"]
+        st.info(f"🤖 Estimativa por IA aplicada. Nome(s) novo(s) sugerido(s), cadastrado(s) ao salvar: **{', '.join(novos)}**.")
+    elif not df_rev.empty:
+        st.info("🤖 Estimativa de esforço e classificação por IA aplicada.")
+
+    ja_existentes = resultado["ja_existentes"]
+    if not ja_existentes.empty:
+        with st.expander(f"{len(ja_existentes)} linha(s) já estavam salvas e foram ignoradas"):
+            df_ja = ja_existentes[["log_date", "description"]].copy()
+            df_ja["log_date"] = df_ja["log_date"].map(format_date_ptbr)
+            st.dataframe(
+                df_ja.rename(columns={"log_date": "Data", "description": "Descrição"}),
+                hide_index=True, use_container_width=True,
+            )
+
+    edited = pd.DataFrame()
+    if df_rev.empty:
+        st.success("Nenhuma tarefa nova -- ao salvar, só a anotação vai para o Caderno.")
+    else:
+        df_editor = df_rev.copy()
+        df_editor["log_date"] = pd.to_datetime(df_editor["log_date"]).dt.date
+        df_editor.insert(0, "_Aplicar", True)
+        # O PORQUE: um projeto/categoria novo sugerido pela IA ainda não está
+        # nas opções cadastradas -- entra na lista do dropdown para a célula
+        # continuar mostrando o valor sugerido.
+        opcoes_projeto = sorted(set(get_project_options()) | set(df_editor["project"].dropna()), key=str.casefold)
+        opcoes_categoria = sorted(set(get_category_options()) | set(df_editor["category"].dropna()), key=str.casefold)
+        st.write("Desmarque `Aplicar` para não salvar uma linha. Todos os campos podem ser editados.")
+        edited = st.data_editor(
+            df_editor,
+            column_config={
+                "_Aplicar": st.column_config.CheckboxColumn("Aplicar", default=True),
+                "log_date": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
+                "project": st.column_config.SelectboxColumn("Projeto", options=opcoes_projeto),
+                "category": st.column_config.SelectboxColumn("Categoria", options=opcoes_categoria),
+                "description": st.column_config.TextColumn("Descrição", width="large"),
+                "effort_hours": st.column_config.NumberColumn("Horas", min_value=0.0, max_value=24.0, step=0.25),
+                "is_impedimento": st.column_config.CheckboxColumn("🚧 Impedimento"),
+                "is_duvida": st.column_config.CheckboxColumn("❓ Dúvida"),
+            },
+            hide_index=True,
+            use_container_width=True,
+            num_rows="fixed",
+            key=f"diario_editor_{st.session_state.diario_geracao}",
+        )
+
+        aplicadas = edited[edited["_Aplicar"] == True]
+        if not aplicadas.empty:
+            horas_ja_salvas = resultado["horas_ja_salvas"]
+            partes = []
+            for dia, horas in aplicadas.groupby("log_date")["effort_hours"].sum().sort_index().items():
+                dia_iso = dia.strftime("%Y-%m-%d") if hasattr(dia, "strftime") else str(dia)[:10]
+                ja = horas_ja_salvas.get(dia_iso, 0.0) or 0.0
+                parte = f"**{format_date_ptbr(dia_iso)}**: {horas + ja:.2f}h"
+                if ja:
+                    parte += f" (com {ja:.2f}h já salvas)"
+                partes.append(parte)
+            st.caption("Total por dia, se salvar: " + " • ".join(partes))
+
+    notas = resultado["notas"]
+    dias_notas = ", ".join(format_date_ptbr(d) for d in sorted(notas))
+    col_salvar, col_descartar = st.columns(2)
+    with col_salvar:
+        if st.button("💾 Salvar", type="primary", use_container_width=True, key="diario_btn_salvar"):
+            qtd = int((edited["_Aplicar"] == True).sum()) if not edited.empty else 0
+            request_confirmation(
+                "diario_salvar",
+                {"edited": edited, "notas": notas},
+                title="Salvar Diário",
+                message=f"Salvar **{qtd} registro(s)** e a anotação de **{dias_notas}** no Caderno?",
+                success_message="Diário salvo.",
+                processing_message="Salvando...",
+                confirm_label="Sim, salvar",
+            )
+    with col_descartar:
+        # O PORQUE: descartar só a revisão -- o texto continua no campo
+        # acima, então dá pra ajustar e gerar de novo sem perder nada.
+        if st.button("Descartar revisão", use_container_width=True, key="diario_btn_descartar"):
+            st.session_state.diario_resultado = None
+            st.rerun()
+
+
+def _render_diario_caderno():
+    st.header("Caderno")
+    st.caption(
+        "Tudo o que foi escrito no Diário (e o histórico importado do OneNote), dia a dia. "
+        "Editar uma anotação não altera os registros de atividade."
+    )
+
+    hoje = agora_br().date()
+    with st.form("caderno_filtro_form"):
+        c_ini, c_fim, c_busca = st.columns([2, 2, 3])
+        with c_ini:
+            ini = st.date_input("De", value=hoje - timedelta(days=30), format="DD/MM/YYYY", key="caderno_ini")
+        with c_fim:
+            fim = st.date_input("Até", value=hoje, format="DD/MM/YYYY", key="caderno_fim")
+        with c_busca:
+            busca = st.text_input("Buscar", key="caderno_busca", placeholder="palavra ou trecho (ignora acentos)")
+        todo_historico = st.checkbox("Buscar em todo o histórico (ignora o período)", key="caderno_todo")
+        st.form_submit_button("Aplicar", type="primary")
+
+    username = _current_user()
+    if todo_historico:
+        df_notas = repo.get_daily_notes_as_dataframe(username)
+    elif ini > fim:
+        st.error("A data inicial não pode ser depois da data final.")
+        df_notas = pd.DataFrame()
+    else:
+        df_notas = repo.get_daily_notes_as_dataframe(username, ini.strftime("%Y-%m-%d"), fim.strftime("%Y-%m-%d"))
+
+    if busca.strip() and not df_notas.empty:
+        termo = _chave_descricao(busca)
+        df_notas = df_notas[df_notas["content"].map(_chave_descricao).str.contains(termo, regex=False)]
+
+    if df_notas.empty:
+        st.info("Nenhuma anotação encontrada.")
+    else:
+        total = len(df_notas)
+        if total > CADERNO_LIMITE_DIAS:
+            st.caption(f"Mostrando os {CADERNO_LIMITE_DIAS} dias mais recentes de {total} encontrados -- refine o período ou a busca.")
+        else:
+            st.caption(f"{total} dia(s) encontrado(s).")
+
+        editando = st.session_state.get("caderno_editando")
+        for _, nota in df_notas.head(CADERNO_LIMITE_DIAS).iterrows():
+            data_iso = str(nota["note_date"])[:10]
+            data_fmt = format_date_ptbr(data_iso)
+            dia_semana = DIAS_DA_SEMANA_PTBR[datetime.strptime(data_iso, "%Y-%m-%d").weekday()]
+            with st.expander(f"📅 {data_fmt} — {dia_semana}", expanded=(total <= 3 or editando == data_iso)):
+                if editando == data_iso:
+                    novo_texto = st.text_area(
+                        "Anotação", value=nota["content"], height=240,
+                        key=f"caderno_txt_{data_iso}", label_visibility="collapsed",
+                    )
+                    st.caption("Deixar o texto vazio apaga a anotação deste dia.")
+                    c_salvar, c_cancelar = st.columns(2)
+                    with c_salvar:
+                        if st.button("Salvar anotação", type="primary", use_container_width=True, key=f"caderno_salvar_{data_iso}"):
+                            request_confirmation(
+                                "caderno_salvar_nota",
+                                {"data": data_iso, "texto": novo_texto},
+                                title="Salvar anotação",
+                                message=(
+                                    f"Substituir a anotação de **{data_fmt}** pelo texto editado?"
+                                    if novo_texto.strip()
+                                    else f"Apagar a anotação de **{data_fmt}**? Os registros de atividade desse dia não mudam."
+                                ),
+                                success_message="Anotação salva.",
+                                processing_message="Salvando...",
+                                confirm_label="Sim, salvar",
+                            )
+                    with c_cancelar:
+                        if st.button("Cancelar", use_container_width=True, key=f"caderno_cancelar_{data_iso}"):
+                            st.session_state.pop("caderno_editando", None)
+                            st.rerun()
+                else:
+                    # O PORQUE: white-space: pre-wrap preserva as quebras de
+                    # linha e a indentação dos subitens como foram escritas,
+                    # mas ainda quebra linhas longas (URLs do Azure) na largura
+                    # da tela. html.escape porque o texto vai dentro de HTML.
+                    st.markdown(
+                        f"<div style='white-space: pre-wrap; overflow-wrap: anywhere;'>{html.escape(str(nota['content']))}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    if st.button("✏️ Editar", key=f"caderno_editar_{data_iso}"):
+                        st.session_state.caderno_editando = data_iso
+                        st.rerun()
+
+    st.markdown("---")
+    with st.expander("📥 Importar histórico do OneNote para o Caderno"):
+        st.caption(
+            "Envie um .txt no formato do OneNote (a data `dd/mm/aaaa:` seguida das tarefas daquele dia). "
+            "Cada dia vira uma anotação no Caderno. Dias que já têm anotação são mantidos como estão, e "
+            "nenhum registro de atividade é criado ou alterado -- para gerar registros a partir de um "
+            "texto, cole-o em ✍️ Escrever o dia."
+        )
+        arquivo = st.file_uploader("Arquivo .txt", type=["txt"], key="caderno_upload")
+        if st.button("Importar para o Caderno", disabled=arquivo is None, key="caderno_btn_importar"):
+            if arquivo.size > MAX_UPLOAD_SIZE_BYTES:
+                st.error(f"Arquivo acima do limite de {MAX_UPLOAD_SIZE_MB}MB.")
+            else:
+                notas = HistoryParser.split_text_by_date(_decodificar_txt(arquivo.read()))
+                if not notas:
+                    st.warning("Nenhuma data no formato `dd/mm/aaaa:` encontrada no arquivo.")
+                else:
+                    datas = sorted(notas)
+                    request_confirmation(
+                        "caderno_importar",
+                        {"notas": notas},
+                        title="Importar para o Caderno",
+                        message=(
+                            f"Importar **{len(notas)} dia(s)** ({format_date_ptbr(datas[0])} a "
+                            f"{format_date_ptbr(datas[-1])}) para o Caderno? Dias que já têm anotação são mantidos."
+                        ),
+                        success_message="Importação concluída.",
+                        processing_message="Importando...",
+                        confirm_label="Sim, importar",
+                    )
+
+
+if is_admin:
+    with tab_diario:
+        modo_diario = st.radio(
+            "Modo do Diário", ["✍️ Escrever o dia", "📖 Caderno"],
+            horizontal=True, key="diario_modo", label_visibility="collapsed",
+        )
+        if modo_diario == "📖 Caderno":
+            _render_diario_caderno()
+        else:
+            _render_diario_escrever()
 
 # ==========================================
 # TAB 2: DAILY SCRUM
@@ -4259,6 +4738,11 @@ if is_admin:
 
         st.header("Sincronizar Arquivo de Histórico")
         st.info("Envie o arquivo de histórico (.txt ou .csv) para comparar com os registros já salvos. Você poderá escolher, um a um, o que aplicar. No final, vamos pedir que você digite o nome do arquivo enviado para confirmar a operação.")
+        # O PORQUE: a Sincronização espelha o arquivo -- tudo que está salvo e
+        # não está no arquivo é proposto para remoção (já marcado). Registros
+        # lançados pelo Diário nunca estão num arquivo antigo, então cairiam
+        # todos nessa lista.
+        st.warning("Usa o **Diário**? Registros lançados por lá não estão no arquivo e vão aparecer em 🔴 Registros para Remover -- desmarque-os antes de confirmar. Para lançar o dia a dia, prefira a aba Diário.")
 
         # O PORQUE: Upload em memória (UploadedFile) substitui a leitura fixa de
         # "raw_history.txt" na raiz do projeto. Isso permite sincronizar a partir
