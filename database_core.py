@@ -519,6 +519,64 @@ class LogRepository:
         self.conn.execute("DELETE FROM daily_notes WHERE username = ? AND note_date = ?", (username, note_date))
         self.conn.commit()
 
+    def get_log_date_and_description(self, log_id: int, username: str):
+        # O PORQUE: editar ou excluir um registro precisa saber como ele
+        # estava antes, para achar a linha correspondente na anotação do dia.
+        cursor = self.conn.execute(
+            "SELECT log_date, description FROM work_logs WHERE id = ? AND username = ?", (log_id, username)
+        )
+        rows = cursor.fetchall()
+        return tuple(rows[0]) if rows else None
+
+    def apply_day_changes(self, username: str, note_date: str, inserts: list, updates: list, delete_ids: list,
+                          note_text: str = None):
+        # O PORQUE: edição feita pelo Caderno e aplicada nos registros. Tudo
+        # vai num único commit: se a rede cair no meio, o dia não fica metade
+        # alterado, com a anotação dizendo uma coisa e os registros outra.
+        # note_text: None mantém a anotação, "" apaga, outro texto substitui.
+        try:
+            if inserts:
+                self.conn.executemany(
+                    "INSERT INTO work_logs (username, log_date, project, category, description, effort_hours, "
+                    "is_impedimento, is_duvida) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (username, note_date, r["project"], r["category"], r["description"], r["effort_hours"],
+                         int(bool(r["is_impedimento"])), int(bool(r["is_duvida"])))
+                        for r in inserts
+                    ],
+                )
+            if updates:
+                self.conn.executemany(
+                    "UPDATE work_logs SET project = ?, category = ?, description = ?, effort_hours = ?, "
+                    "is_impedimento = ?, is_duvida = ? WHERE id = ? AND username = ?",
+                    [
+                        (r["project"], r["category"], r["description"], r["effort_hours"],
+                         int(bool(r["is_impedimento"])), int(bool(r["is_duvida"])), r["id"], username)
+                        for r in updates
+                    ],
+                )
+            if delete_ids:
+                placeholders = ", ".join(["?"] * len(delete_ids))
+                self.conn.execute(
+                    f"DELETE FROM work_logs WHERE username = ? AND id IN ({placeholders})", (username, *delete_ids)
+                )
+            if note_text is not None:
+                if note_text.strip():
+                    self.conn.execute(
+                        "INSERT INTO daily_notes (username, note_date, content) VALUES (?, ?, ?) "
+                        "ON CONFLICT(username, note_date) DO UPDATE SET content = excluded.content, "
+                        "updated_at = CURRENT_TIMESTAMP",
+                        (username, note_date, note_text.strip()),
+                    )
+                else:
+                    self.conn.execute(
+                        "DELETE FROM daily_notes WHERE username = ? AND note_date = ?", (username, note_date)
+                    )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
     # ==========================================
     # SOLICITAÇÕES DE ACESSO DE CONVIDADO
     # ==========================================

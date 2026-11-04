@@ -1618,21 +1618,240 @@ def preparar_registros_diario(texto: str, data_padrao, username: str) -> dict:
     df_novos = df[~ja_existe].reset_index(drop=True)
 
     if not df_novos.empty:
-        if N8N_AI_ESTIMATE_WEBHOOK_URL:
-            df_novos, novos_p, novas_c, ia_aviso = aplicar_estimativa_ia_e_normalizacao(df_novos, df_ja_salvos=df_salvos)
-            resultado.update(novos_projetos=novos_p, novas_categorias=novas_c, ia_aviso=ia_aviso)
-        else:
-            resultado["ia_aviso"] = "N8N_AI_ESTIMATE_WEBHOOK_URL não configurado nos Secrets"
-        if resultado["ia_aviso"]:
-            # O PORQUE: sem IA, cada linha vem com 1h fixa -- em vez de deixar
-            # assim (um dia de 12 linhas viraria 12h), divide igualmente o que
-            # falta para 8h naquele dia. É só um ponto de partida para a
-            # revisão; a estimativa de verdade depende da IA.
-            overtime_days, horas_ja_salvas = _contexto_dias_ja_salvos(df_novos, df_salvos)
-            df_novos = normalizar_horas_por_dia(df_novos, overtime_days, horas_ja_salvas=horas_ja_salvas)
+        df_novos, novos_p, novas_c, ia_aviso = _estimar_registros_novos(df_novos, df_salvos)
+        resultado.update(novos_projetos=novos_p, novas_categorias=novas_c, ia_aviso=ia_aviso)
 
     resultado["df"] = df_novos
     return resultado
+
+
+def _estimar_registros_novos(df_novos: pd.DataFrame, df_salvos: pd.DataFrame) -> tuple:
+    """Estima horas e classifica as linhas novas do Diário e do Caderno.
+    Retorna (df, novos_projetos, novas_categorias, ia_aviso)."""
+    novos_p, novas_c = [], []
+    if N8N_AI_ESTIMATE_WEBHOOK_URL:
+        df_novos, novos_p, novas_c, ia_aviso = aplicar_estimativa_ia_e_normalizacao(df_novos, df_ja_salvos=df_salvos)
+    else:
+        ia_aviso = "N8N_AI_ESTIMATE_WEBHOOK_URL não configurado nos Secrets"
+    if ia_aviso:
+        # O PORQUE: sem IA, cada linha vem com 1h fixa -- em vez de deixar
+        # assim (um dia de 12 linhas viraria 12h), divide igualmente o que
+        # falta para 8h naquele dia. É só um ponto de partida para a
+        # revisão; a estimativa de verdade depende da IA.
+        overtime_days, horas_ja_salvas = _contexto_dias_ja_salvos(df_novos, df_salvos)
+        df_novos = normalizar_horas_por_dia(df_novos, overtime_days, horas_ja_salvas=horas_ja_salvas)
+    return df_novos, novos_p, novas_c, ia_aviso
+
+
+# ==========================================
+# CADERNO (texto do dia <-> registros)
+# ==========================================
+CADERNO_ACAO_MANTER = "Sem alteração"
+CADERNO_ACAO_ALTERAR = "Alterar"
+CADERNO_ACAO_INCLUIR = "Incluir"
+CADERNO_ACAO_EXCLUIR = "Excluir"
+
+
+def _refletir_registros_nas_anotacoes(username: str, mudancas: list):
+    """
+    Mantém o texto do Caderno de acordo com o que mudou nos registros.
+    `mudancas` é uma lista de (data_antes, descricao_antes, data_depois,
+    descricao_depois): sem "antes" é registro novo, sem "depois" é exclusão.
+
+    O PORQUE: os registros aparecem no Caderno direto de work_logs, então já
+    estão sempre certos, mas a anotação é um texto guardado à parte. Sem isto,
+    corrigir um registro deixaria o Caderno mostrando a versão nova e a antiga
+    no mesmo dia. Dia sem anotação não tem nada para atualizar.
+    """
+    mudancas = [m for m in mudancas if (m[0], m[1]) != (m[2], m[3])]
+    datas = sorted({d for m in mudancas for d in (m[0], m[2]) if d})
+    if not datas:
+        return
+
+    df_notas = repo.get_daily_notes_as_dataframe(username, datas[0], datas[-1])
+    if df_notas.empty:
+        return
+    notas = dict(zip(df_notas["note_date"].astype(str).str[:10], df_notas["content"].astype(str)))
+    originais = dict(notas)
+
+    for data_antes, desc_antes, data_depois, desc_depois in mudancas:
+        if data_antes and data_antes == data_depois:
+            if data_antes in notas:
+                notas[data_antes], _ = HistoryParser.trocar_tarefa_no_texto(notas[data_antes], desc_antes, desc_depois)
+            continue
+        if data_antes in notas:
+            notas[data_antes], _ = HistoryParser.trocar_tarefa_no_texto(notas[data_antes], desc_antes)
+        if data_depois in notas:
+            notas[data_depois] = HistoryParser.acrescentar_tarefa_no_texto(notas[data_depois], desc_depois)
+
+    alteradas = {d: t for d, t in notas.items() if t != originais[d]}
+    repo.save_daily_notes_bulk(username, {d: t for d, t in alteradas.items() if t.strip()}, mode="replace")
+    for data, texto in alteradas.items():
+        if not texto.strip():
+            repo.delete_daily_note(username, data)
+
+
+def _cadastrar_classificacoes_novas(username: str, registros: list):
+    # O PORQUE: "Outros" é o "não classificado" do leitor por palavra-chave
+    # (sem IA) -- não vira opção cadastrada.
+    projetos_conhecidos = set(get_project_options())
+    categorias_conhecidas = set(get_category_options())
+    for registro in registros:
+        if registro["project"] not in projetos_conhecidos and registro["project"] != "Outros":
+            repo.add_custom_option("project", username, registro["project"])
+            projetos_conhecidos.add(registro["project"])
+        if registro["category"] not in categorias_conhecidas and registro["category"] != "Outros":
+            repo.add_custom_option("category", username, registro["category"])
+            categorias_conhecidas.add(registro["category"])
+
+
+def _registro_de_linha_da_revisao(row) -> dict:
+    return {
+        "description": str(row["description"]).strip() if pd.notna(row["description"]) else "",
+        "project": str(row["project"]).strip() if pd.notna(row["project"]) and str(row["project"]).strip() else "Outros",
+        "category": str(row["category"]).strip() if pd.notna(row["category"]) and str(row["category"]).strip() else "Outros",
+        "effort_hours": round(float(row["effort_hours"]), 2) if pd.notna(row["effort_hours"]) else 0.0,
+        "is_impedimento": bool(row["is_impedimento"]) if pd.notna(row["is_impedimento"]) else False,
+        "is_duvida": bool(row["is_duvida"]) if pd.notna(row["is_duvida"]) else False,
+    }
+
+
+def preparar_revisao_caderno(data_iso: str, texto_antigo: str, texto_novo: str, tem_nota: bool, username: str) -> dict:
+    """
+    Monta a revisão de uma edição do Caderno: todos os registros do dia, mais
+    o que a edição do texto muda neles (linha alterada atualiza o registro,
+    linha apagada propõe excluir, linha nova propõe incluir).
+    """
+    alteradas, removidas, incluidas = HistoryParser.comparar_tarefas(texto_antigo, texto_novo)
+    chave = HistoryParser.chave_tarefa
+
+    df_salvos = repo.get_logs_as_dataframe_by_range(username, data_iso, data_iso)
+    if not df_salvos.empty:
+        df_salvos["log_date"] = df_salvos["log_date"].astype(str).str[:10]
+        df_salvos = df_salvos.sort_values("id")
+
+    linhas, originais, por_chave = [], {}, {}
+    for _, registro in df_salvos.iterrows():
+        linha = {
+            "_Aplicar": True, "Ação": CADERNO_ACAO_MANTER, "id": int(registro["id"]), "Antes": "",
+            "_Proposta": str(registro["description"]),
+            **_registro_de_linha_da_revisao(registro),
+        }
+        linha["description"] = str(registro["description"])
+        linhas.append(linha)
+        originais[linha["id"]] = _registro_de_linha_da_revisao(registro)
+        por_chave.setdefault(chave(registro["description"]), []).append(linha)
+
+    # O PORQUE: linha alterada que não corresponde a nenhum registro (texto
+    # importado, por exemplo) fica proposta como inclusão, mas desmarcada: o
+    # registro da mesma tarefa pode existir escrito de outro jeito.
+    incluir_desmarcadas = {}
+    for antes, depois in alteradas:
+        candidatos = por_chave.get(chave(antes))
+        if candidatos:
+            linha = candidatos.pop(0)
+            linha.update({
+                "Ação": CADERNO_ACAO_ALTERAR, "Antes": linha["description"],
+                "description": depois, "_Proposta": depois,
+            })
+        else:
+            incluir_desmarcadas[depois] = antes
+
+    ids_excluidos = []
+    for antes in removidas:
+        candidatos = por_chave.get(chave(antes))
+        if candidatos:
+            linha = candidatos.pop(0)
+            linha["Ação"] = CADERNO_ACAO_EXCLUIR
+            ids_excluidos.append(linha["id"])
+
+    # O PORQUE: mesma regra do Diário -- uma linha igual a um registro que já
+    # está no dia não cria outro.
+    descricoes_novas = [
+        d for d in list(dict.fromkeys(incluidas)) + list(incluir_desmarcadas)
+        if not por_chave.get(chave(d))
+    ]
+
+    ia_aviso, novos_projetos, novas_categorias = None, [], []
+    if descricoes_novas:
+        df_novos = HistoryParser().registros_de_descricoes(data_iso, descricoes_novas)
+        df_base = df_salvos[~df_salvos["id"].isin(ids_excluidos)] if not df_salvos.empty else df_salvos
+        df_novos, novos_projetos, novas_categorias, ia_aviso = _estimar_registros_novos(df_novos, df_base)
+        for _, novo in df_novos.iterrows():
+            linhas.append({
+                "_Aplicar": novo["description"] not in incluir_desmarcadas,
+                "Ação": CADERNO_ACAO_INCLUIR, "id": None,
+                "Antes": incluir_desmarcadas.get(novo["description"], ""),
+                "_Proposta": novo["description"],
+                **_registro_de_linha_da_revisao(novo),
+            })
+
+    colunas = ["_Aplicar", "Ação", "id", "Antes", "_Proposta", "description", "effort_hours",
+               "project", "category", "is_impedimento", "is_duvida"]
+    return {
+        "data": data_iso, "texto_antigo": texto_antigo, "texto_novo": texto_novo, "tem_nota": tem_nota,
+        "df": pd.DataFrame(linhas, columns=colunas), "originais": originais, "ia_aviso": ia_aviso,
+        "novos_projetos": novos_projetos, "novas_categorias": novas_categorias,
+    }
+
+
+def _separar_revisao_caderno(edited: pd.DataFrame, originais: dict) -> tuple:
+    """Traduz a tabela de revisão em (inclusoes, alteracoes, exclusoes)."""
+    inclusoes, alteracoes, exclusoes = [], [], []
+    if edited.empty:
+        return inclusoes, alteracoes, exclusoes
+    for _, row in edited[edited["_Aplicar"] == True].iterrows():
+        existente = pd.notna(row["id"])
+        if row["Ação"] == CADERNO_ACAO_EXCLUIR:
+            if existente:
+                exclusoes.append(int(row["id"]))
+            continue
+        registro = _registro_de_linha_da_revisao(row)
+        if not registro["description"]:
+            continue
+        if not existente:
+            inclusoes.append(registro)
+        elif registro != originais[int(row["id"])]:
+            alteracoes.append({**registro, "id": int(row["id"])})
+    return inclusoes, alteracoes, exclusoes
+
+
+def _texto_final_da_revisao(revisao: dict, edited: pd.DataFrame):
+    """Texto a gravar no Caderno (None = não mexer; "" = apagar a anotação)."""
+    texto_mudou = revisao["texto_novo"].strip() != revisao["texto_antigo"].strip()
+    # O PORQUE: num dia sem anotação, o texto da edição foi só montado a partir
+    # dos registros. Se a pessoa mudou apenas as horas na tabela, não há
+    # anotação para criar.
+    if not revisao["tem_nota"] and not texto_mudou:
+        return None
+
+    texto = revisao["texto_novo"]
+    if not edited.empty:
+        # O PORQUE: a descrição também pode ser mudada direto na tabela, e aí
+        # o texto precisa acompanhar para os dois continuarem iguais.
+        for _, row in edited[edited["_Aplicar"] == True].iterrows():
+            if row["Ação"] == CADERNO_ACAO_EXCLUIR:
+                texto, _ = HistoryParser.trocar_tarefa_no_texto(texto, row["_Proposta"])
+                continue
+            descricao = str(row["description"]).strip() if pd.notna(row["description"]) else ""
+            if descricao and descricao != row["_Proposta"]:
+                texto, _ = HistoryParser.trocar_tarefa_no_texto(texto, row["_Proposta"], descricao)
+
+    texto = texto.strip()
+    if not revisao["tem_nota"]:
+        # O PORQUE: num dia sem anotação, se tudo o que está no texto já virou
+        # registro, gravá-lo só criaria uma segunda cópia dos mesmos registros.
+        # A anotação nasce apenas se sobrar algo que não está nos registros
+        # (texto depois de "---" ou uma linha que a pessoa não quis aplicar).
+        inclusoes, alteracoes, exclusoes = _separar_revisao_caderno(edited, revisao["originais"])
+        descricoes_finais = {rid: reg["description"] for rid, reg in revisao["originais"].items() if rid not in exclusoes}
+        descricoes_finais.update({reg["id"]: reg["description"] for reg in alteracoes})
+        chaves_finais = {HistoryParser.chave_tarefa(d) for d in descricoes_finais.values()}
+        chaves_finais |= {HistoryParser.chave_tarefa(reg["description"]) for reg in inclusoes}
+        tudo_nos_registros = all(HistoryParser.chave_tarefa(t) in chaves_finais for t in HistoryParser.tarefas_do_texto(texto))
+        if tudo_nos_registros and not HistoryParser.tem_texto_alem_das_tarefas(texto):
+            return None
+    return None if texto == revisao["texto_antigo"].strip() else texto
 
 
 @st.dialog("Recalcular Esforço com IA")
@@ -2008,6 +2227,12 @@ if 'diario_resultado' not in st.session_state:
     st.session_state.diario_resultado = None
 if 'diario_geracao' not in st.session_state:
     st.session_state.diario_geracao = 0
+# O PORQUE: mesmo esquema do Diário, para a revisão de uma edição do Caderno
+# que vai ser aplicada nos registros.
+if 'caderno_revisao' not in st.session_state:
+    st.session_state.caderno_revisao = None
+if 'caderno_geracao' not in st.session_state:
+    st.session_state.caderno_geracao = 0
 
 # O PORQUE: mapeia o rótulo exibido no cabeçalho para o nome real da coluna
 # no DataFrame, usado tanto para renderizar o botão quanto para ordenar.
@@ -2202,6 +2427,7 @@ def execute_processing_action(action: dict) -> bool:
     elif t == "insert_log":
         d = p
         repo.insert_log(username, d['date'], d['proj'], d['cat'], d['desc'], d['eff'], d.get('imp', False), d.get('duv', False))
+        _refletir_registros_nas_anotacoes(username, [(None, None, str(d['date'])[:10], d['desc'])])
         if d.get('continuar_adicionando'):
             reset_add_form_stay()
             action["success_message"] = "Registro salvo! Formulário pronto para o próximo."
@@ -2211,12 +2437,18 @@ def execute_processing_action(action: dict) -> bool:
 
     elif t == "update_log":
         d = p
+        antes = repo.get_log_date_and_description(d['target_id'], username)
         repo.update_log(d['target_id'], username, d['date'], d['proj'], d['cat'], d['desc'], d['eff'], d.get('imp', False), d.get('duv', False))
+        if antes:
+            _refletir_registros_nas_anotacoes(username, [(str(antes[0])[:10], antes[1], str(d['date'])[:10], d['desc'])])
         reset_states(full_reset=True)
         return True
 
     elif t == "delete_log":
+        antes = repo.get_log_date_and_description(p["log_id"], username)
         repo.delete_log(p["log_id"], username)
+        if antes:
+            _refletir_registros_nas_anotacoes(username, [(str(antes[0])[:10], antes[1], None, None)])
         reset_states(full_reset=True)
         return True
 
@@ -2368,6 +2600,7 @@ def execute_processing_action(action: dict) -> bool:
         edited_delete = p["edited_delete"]
         records_inserted = 0
         records_deleted = 0
+        mudancas_nas_anotacoes = []
 
         if not edited_insert.empty:
             to_insert = edited_insert[edited_insert["_Aplicar"] == True]
@@ -2388,11 +2621,17 @@ def execute_processing_action(action: dict) -> bool:
                     "is_duvida": bool(row.get("is_duvida", False)),
                 })
             records_inserted = repo.insert_logs_bulk(username, rows_to_insert)
+            mudancas_nas_anotacoes += [(None, None, r["log_date"][:10], r["description"]) for r in rows_to_insert]
 
         if not edited_delete.empty:
             to_delete = edited_delete[edited_delete["_Aplicar"] == True]
             records_deleted = repo.delete_logs_bulk(username, to_delete["id"].tolist())
+            mudancas_nas_anotacoes += [
+                (str(data)[:10], desc, None, None)
+                for data, desc in zip(to_delete["log_date"], to_delete["description"])
+            ]
 
+        _refletir_registros_nas_anotacoes(username, mudancas_nas_anotacoes)
         st.session_state.sync_analyzed = False
         action["success_message"] = f"Prontinho! {records_inserted} registro(s) adicionado(s) e {records_deleted} removido(s)."
         return True
@@ -2415,24 +2654,22 @@ def execute_processing_action(action: dict) -> bool:
         # cadastrados aqui, só para as linhas que de fato foram salvas.
         edited = p["edited"]
         rows_to_insert = []
+        mudancas_na_revisao = []
+        resultado_gerado = st.session_state.diario_resultado
+        df_gerado = resultado_gerado["df"] if resultado_gerado else pd.DataFrame()
         if not edited.empty:
-            projetos_conhecidos = set(get_project_options())
-            categorias_conhecidas = set(get_category_options())
-            for _, row in edited[edited["_Aplicar"] == True].iterrows():
+            for idx, row in edited[edited["_Aplicar"] == True].iterrows():
                 descricao = str(row["description"]).strip() if pd.notna(row["description"]) else ""
                 if not descricao or pd.isna(row["log_date"]):
                     continue
                 log_date_iso = row["log_date"].strftime("%Y-%m-%d") if hasattr(row["log_date"], "strftime") else str(row["log_date"])[:10]
                 projeto = str(row["project"]).strip() if pd.notna(row["project"]) and str(row["project"]).strip() else "Outros"
                 categoria = str(row["category"]).strip() if pd.notna(row["category"]) and str(row["category"]).strip() else "Outros"
-                # O PORQUE: "Outros" é o "não classificado" do leitor por
-                # palavra-chave (sem IA) -- não vira opção cadastrada.
-                if projeto not in projetos_conhecidos and projeto != "Outros":
-                    repo.add_custom_option("project", username, projeto)
-                    projetos_conhecidos.add(projeto)
-                if categoria not in categorias_conhecidas and categoria != "Outros":
-                    repo.add_custom_option("category", username, categoria)
-                    categorias_conhecidas.add(categoria)
+                # O PORQUE: descrição ou data corrigida na revisão -- o texto
+                # guardado no Caderno precisa acompanhar o registro salvo.
+                if idx in df_gerado.index:
+                    gerado = df_gerado.loc[idx]
+                    mudancas_na_revisao.append((str(gerado["log_date"])[:10], gerado["description"], log_date_iso, descricao))
                 rows_to_insert.append({
                     "log_date": log_date_iso,
                     "project": projeto,
@@ -2446,7 +2683,9 @@ def execute_processing_action(action: dict) -> bool:
         # "append" não duplica texto), e os registros não são. Se a anotação
         # falhar, nenhum registro foi gravado e dá para salvar de novo.
         qtd_notas = repo.save_daily_notes_bulk(username, p["notas"], mode="append")
+        _cadastrar_classificacoes_novas(username, rows_to_insert)
         qtd = repo.insert_logs_bulk(username, rows_to_insert)
+        _refletir_registros_nas_anotacoes(username, mudancas_na_revisao)
         st.session_state.diario_resultado = None
         # O PORQUE: seguro escrever na key do text_area aqui -- o dispatcher
         # roda antes de qualquer widget desta execução ser desenhado.
@@ -2460,6 +2699,30 @@ def execute_processing_action(action: dict) -> bool:
         else:
             repo.delete_daily_note(username, p["data"])
         st.session_state.pop("caderno_editando", None)
+        st.session_state.pop("caderno_rascunho", None)
+        return True
+
+    elif t == "caderno_revisar":
+        st.session_state.caderno_revisao = preparar_revisao_caderno(
+            p["data"], p["texto_antigo"], p["texto_novo"], p["tem_nota"], username,
+        )
+        st.session_state.caderno_geracao += 1
+        return True
+
+    elif t == "caderno_aplicar":
+        revisao = p["revisao"]
+        edited = p["edited"]
+        inclusoes, alteracoes, exclusoes = _separar_revisao_caderno(edited, revisao["originais"])
+        texto_nota = _texto_final_da_revisao(revisao, edited)
+        _cadastrar_classificacoes_novas(username, inclusoes + alteracoes)
+        repo.apply_day_changes(username, revisao["data"], inclusoes, alteracoes, exclusoes, texto_nota)
+        st.session_state.caderno_revisao = None
+        st.session_state.pop("caderno_editando", None)
+        st.session_state.pop("caderno_rascunho", None)
+        action["success_message"] = (
+            f"Caderno e registros atualizados: {len(alteracoes)} alterado(s), "
+            f"{len(inclusoes)} incluído(s) e {len(exclusoes)} excluído(s)."
+        )
         return True
 
     elif t == "caderno_importar":
@@ -2483,6 +2746,14 @@ if st.session_state.processing:
     # clicados.
     action = st.session_state.processing_action
     render_processing_overlay(action.get("processing_message", "Processando..."))
+    # O PORQUE: como nenhum widget é desenhado aqui, o Streamlit apagaria o
+    # estado deles ao fim desta execução. Sem isto, salvar algo no Caderno
+    # devolveria a tela para "Escrever o dia", com os filtros zerados. Regravar
+    # a key a transforma em estado comum, que sobrevive até o próximo rerun.
+    for chave_widget in ("diario_modo", "diario_data", "diario_texto", "caderno_ini", "caderno_fim",
+                         "caderno_busca", "caderno_todo", "caderno_pagina"):
+        if chave_widget in st.session_state:
+            st.session_state[chave_widget] = st.session_state[chave_widget]
     # O PORQUE: zera o estado ANTES de executar. Se a ação der exceção, o
     # script para aqui; com o estado ainda ligado, o próximo rerun executaria
     # a mesma ação de novo -- e uma que já gravou algo gravaria em dobro.
@@ -3405,9 +3676,8 @@ with tab_manage:
 DIAS_DA_SEMANA_PTBR = ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo"]
 
 # O PORQUE: o Caderno desenha um expander por dia -- com o histórico inteiro
-# (300+ dias) numa busca ampla, a tela ficaria pesada. Mostra os mais
-# recentes e pede pra refinar o filtro.
-CADERNO_LIMITE_DIAS = 60
+# (300+ dias) de uma vez, a tela ficaria pesada. Por isso, é paginado.
+CADERNO_DIAS_POR_PAGINA = 30
 
 
 def _decodificar_txt(raw_bytes: bytes) -> str:
@@ -3572,11 +3842,228 @@ def _render_diario_escrever():
             st.rerun()
 
 
+def _montar_dias_caderno(df_notas: pd.DataFrame, df_logs: pd.DataFrame) -> list:
+    # O PORQUE: os registros são lidos de work_logs na hora de desenhar, em vez
+    # de copiados para daily_notes. Assim, o que já existe e o que vier a ser
+    # lançado aparecem por qualquer caminho (Novo Registro, Diário,
+    # Sincronização), e uma edição ou exclusão aparece na mesma hora, sem
+    # migração e sem uma segunda cópia para ficar desatualizada.
+    notas = {}
+    if not df_notas.empty:
+        notas = dict(zip(df_notas["note_date"].astype(str).str[:10], df_notas["content"].astype(str)))
+    registros = {}
+    if not df_logs.empty:
+        df = df_logs.assign(_dia=df_logs["log_date"].astype(str).str[:10]).sort_values("id")
+        registros = dict(tuple(df.groupby("_dia")))
+    return [
+        {"data": data, "nota": notas.get(data, ""), "registros": registros.get(data)}
+        for data in sorted(set(notas) | set(registros), reverse=True)
+    ]
+
+
+def _dia_contem_busca(dia: dict, termo: str) -> bool:
+    partes = [dia["nota"]]
+    if dia["registros"] is not None:
+        for coluna in ("description", "project", "category"):
+            partes += dia["registros"][coluna].astype(str).tolist()
+    return termo in _chave_descricao("\n".join(partes))
+
+
+def _texto_puro(texto: str):
+    # O PORQUE: white-space: pre-wrap preserva a indentação dos subitens como
+    # foram escritos, mas ainda quebra linhas longas (URLs do Azure) na largura
+    # da tela. html.escape porque o texto vai dentro de HTML, e <br> em vez de
+    # quebra de linha porque uma linha em branco encerraria o bloco HTML: o
+    # resto do texto passaria a ser interpretado como Markdown.
+    conteudo = html.escape(str(texto)).replace("\n", "<br>")
+    st.markdown(f"<div style='white-space: pre-wrap; overflow-wrap: anywhere;'>{conteudo}</div>", unsafe_allow_html=True)
+
+
+def _linhas_dos_registros(registros: pd.DataFrame) -> str:
+    linhas = []
+    for _, registro in registros.iterrows():
+        horas = float(registro["effort_hours"]) if pd.notna(registro["effort_hours"]) else 0.0
+        detalhes = [f"{horas:.2f}h", str(registro["project"]), str(registro["category"])]
+        if pd.notna(registro["is_impedimento"]) and bool(registro["is_impedimento"]):
+            detalhes.append("🚧 Impedimento")
+        if pd.notna(registro["is_duvida"]) and bool(registro["is_duvida"]):
+            detalhes.append("❓ Dúvida")
+        linhas.append(f"• {registro['description']} — {' · '.join(detalhes)}")
+    return "\n".join(linhas)
+
+
+def _rotulo_dia_caderno(dia: dict) -> str:
+    dia_semana = DIAS_DA_SEMANA_PTBR[datetime.strptime(dia["data"], "%Y-%m-%d").weekday()]
+    rotulo = f"📅 {format_date_ptbr(dia['data'])} — {dia_semana}"
+    if dia["registros"] is not None:
+        horas = pd.to_numeric(dia["registros"]["effort_hours"], errors="coerce").sum()
+        rotulo += f" · {len(dia['registros'])} registro(s) · {horas:.2f}h"
+    return rotulo
+
+
+def _render_caderno_revisao(revisao: dict):
+    data_fmt = format_date_ptbr(revisao["data"])
+    st.markdown("**Revisão: como os registros deste dia vão ficar**")
+
+    if revisao["ia_aviso"]:
+        st.warning(
+            f"⚠️ Sem estimativa por IA desta vez ({revisao['ia_aviso']}). As linhas novas dividem "
+            "igualmente o que falta para 8h, com projeto/categoria por palavra-chave -- ajuste o que precisar."
+        )
+    elif revisao["novos_projetos"] or revisao["novas_categorias"]:
+        novos = revisao["novos_projetos"] + revisao["novas_categorias"]
+        st.info(f"🤖 Nome(s) novo(s) sugerido(s) pela IA, cadastrado(s) ao salvar: **{', '.join(novos)}**.")
+
+    df_revisao = revisao["df"]
+    edited = df_revisao
+    if df_revisao.empty:
+        st.info("Este dia não tem registros para alterar -- ao salvar, só o texto do Caderno muda.")
+    else:
+        opcoes_projeto = sorted(set(get_project_options()) | set(df_revisao["project"].dropna()), key=str.casefold)
+        opcoes_categoria = sorted(set(get_category_options()) | set(df_revisao["category"].dropna()), key=str.casefold)
+        st.caption(
+            "Todos os registros do dia, com o que a sua edição muda neles. Qualquer campo pode ser "
+            "corrigido aqui, e `Ação` = Excluir remove o registro. Desmarque `Aplicar` para não mexer na linha."
+        )
+        edited = st.data_editor(
+            df_revisao,
+            column_config={
+                "_Aplicar": st.column_config.CheckboxColumn("Aplicar", default=True),
+                "Ação": st.column_config.SelectboxColumn(
+                    "Ação",
+                    options=[CADERNO_ACAO_MANTER, CADERNO_ACAO_ALTERAR, CADERNO_ACAO_INCLUIR, CADERNO_ACAO_EXCLUIR],
+                    required=True,
+                ),
+                "Antes": st.column_config.TextColumn("Antes", disabled=True),
+                "description": st.column_config.TextColumn("Descrição", width="large"),
+                "effort_hours": st.column_config.NumberColumn("Horas", min_value=0.0, max_value=24.0, step=0.25),
+                "project": st.column_config.SelectboxColumn("Projeto", options=opcoes_projeto),
+                "category": st.column_config.SelectboxColumn("Categoria", options=opcoes_categoria),
+                "is_impedimento": st.column_config.CheckboxColumn("🚧 Impedimento"),
+                "is_duvida": st.column_config.CheckboxColumn("❓ Dúvida"),
+            },
+            column_order=["_Aplicar", "Ação", "description", "Antes", "effort_hours", "project", "category",
+                          "is_impedimento", "is_duvida"],
+            hide_index=True,
+            use_container_width=True,
+            num_rows="fixed",
+            key=f"caderno_editor_{st.session_state.caderno_geracao}",
+        )
+
+    inclusoes, alteracoes, exclusoes = _separar_revisao_caderno(edited, revisao["originais"])
+    horas_por_id = {rid: reg["effort_hours"] for rid, reg in revisao["originais"].items()}
+    horas_por_id.update({reg["id"]: reg["effort_hours"] for reg in alteracoes})
+    for rid in exclusoes:
+        horas_por_id.pop(rid, None)
+    total_dia = sum(horas_por_id.values()) + sum(reg["effort_hours"] for reg in inclusoes)
+    st.caption(f"Total de {data_fmt}, se salvar: **{total_dia:.2f}h**")
+
+    c_salvar, c_voltar = st.columns(2)
+    with c_salvar:
+        if st.button("💾 Salvar", type="primary", use_container_width=True, key="caderno_btn_aplicar"):
+            texto_nota = _texto_final_da_revisao(revisao, edited)
+            if not (inclusoes or alteracoes or exclusoes) and texto_nota is None:
+                st.info("Nada foi alterado.")
+            else:
+                mensagem = (
+                    f"Em **{data_fmt}**: **{len(alteracoes)}** registro(s) alterado(s), "
+                    f"**{len(inclusoes)}** incluído(s) e **{len(exclusoes)}** excluído(s)."
+                )
+                if texto_nota is not None:
+                    mensagem += " O texto do Caderno também será atualizado."
+                if exclusoes:
+                    mensagem += " A exclusão não pode ser desfeita."
+                request_confirmation(
+                    "caderno_aplicar",
+                    {"revisao": revisao, "edited": edited},
+                    title="Aplicar nos registros",
+                    message=mensagem,
+                    success_message="Caderno e registros atualizados.",
+                    processing_message="Salvando...",
+                    confirm_label="Sim, aplicar",
+                )
+    with c_voltar:
+        if st.button("Voltar a editar o texto", use_container_width=True, key="caderno_btn_voltar"):
+            st.session_state.caderno_rascunho = {revisao["data"]: revisao["texto_novo"]}
+            st.session_state.caderno_revisao = None
+            st.rerun()
+
+
+def _render_caderno_edicao(dia: dict):
+    data_iso = dia["data"]
+    data_fmt = format_date_ptbr(data_iso)
+    revisao = st.session_state.caderno_revisao
+    if revisao and revisao["data"] == data_iso:
+        _render_caderno_revisao(revisao)
+        return
+
+    tem_nota = bool(dia["nota"].strip())
+    # O PORQUE: num dia sem anotação, o texto começa com os registros do dia,
+    # para que também dê para corrigi-los escrevendo, como em qualquer outro dia.
+    texto_base = dia["nota"]
+    if not tem_nota and dia["registros"] is not None:
+        texto_base = "\n".join(f"- {d}" for d in dia["registros"]["description"].astype(str))
+
+    rascunho = st.session_state.get("caderno_rascunho", {}).get(data_iso)
+    novo_texto = st.text_area(
+        "Texto do dia", value=texto_base if rascunho is None else rascunho, height=240,
+        key=f"caderno_txt_{data_iso}", label_visibility="collapsed",
+    )
+    aplicar = st.checkbox(
+        "Aplicar as alterações também nos registros deste dia",
+        value=rascunho is not None, key=f"caderno_aplicar_{data_iso}",
+    )
+    if aplicar:
+        st.caption(
+            "Você revisa antes de gravar. Linha alterada atualiza o registro, linha nova cria um registro "
+            "e linha apagada exclui o registro. O que vier depois de uma linha `---` não vira registro."
+        )
+    else:
+        st.caption(
+            "Só o texto do Caderno muda; os registros ficam como estão."
+            + (" Deixar o texto vazio apaga a anotação deste dia." if tem_nota else "")
+        )
+
+    c_salvar, c_cancelar = st.columns(2)
+    with c_salvar:
+        rotulo = "Revisar alterações" if aplicar else "Salvar só o texto"
+        if st.button(rotulo, type="primary", use_container_width=True, key=f"caderno_salvar_{data_iso}"):
+            if aplicar:
+                run_blocking_action(
+                    "caderno_revisar",
+                    {"data": data_iso, "texto_antigo": texto_base, "texto_novo": novo_texto, "tem_nota": tem_nota},
+                    processing_message="Comparando o texto com os registros...",
+                    success_message="Revise as alterações antes de salvar.",
+                )
+            elif novo_texto.strip() == texto_base.strip():
+                st.info("Nada foi alterado.")
+            else:
+                request_confirmation(
+                    "caderno_salvar_nota",
+                    {"data": data_iso, "texto": novo_texto},
+                    title="Salvar anotação",
+                    message=(
+                        f"Substituir o texto de **{data_fmt}**? Os registros de atividade desse dia não mudam."
+                        if novo_texto.strip()
+                        else f"Apagar a anotação de **{data_fmt}**? Os registros de atividade desse dia não mudam."
+                    ),
+                    success_message="Anotação salva.",
+                    processing_message="Salvando...",
+                    confirm_label="Sim, salvar",
+                )
+    with c_cancelar:
+        if st.button("Cancelar", use_container_width=True, key=f"caderno_cancelar_{data_iso}"):
+            st.session_state.pop("caderno_editando", None)
+            st.session_state.pop("caderno_rascunho", None)
+            st.rerun()
+
+
 def _render_diario_caderno():
     st.header("Caderno")
     st.caption(
-        "Tudo o que foi escrito no Diário (e o histórico importado do OneNote), dia a dia. "
-        "Editar uma anotação não altera os registros de atividade."
+        "O seu histórico dia a dia: todos os registros de atividade, venham de onde vierem, e o texto "
+        "escrito no Diário ou importado do OneNote. Ao editar um dia, você escolhe se a alteração "
+        "vale só para o texto ou também para os registros."
     )
 
     hoje = agora_br().date()
@@ -3592,70 +4079,59 @@ def _render_diario_caderno():
         st.form_submit_button("Aplicar", type="primary")
 
     username = _current_user()
+    df_notas, df_logs = pd.DataFrame(), pd.DataFrame()
     if todo_historico:
         df_notas = repo.get_daily_notes_as_dataframe(username)
+        df_logs = repo.get_all_logs_as_dataframe(username)
     elif ini > fim:
         st.error("A data inicial não pode ser depois da data final.")
-        df_notas = pd.DataFrame()
     else:
-        df_notas = repo.get_daily_notes_as_dataframe(username, ini.strftime("%Y-%m-%d"), fim.strftime("%Y-%m-%d"))
+        inicio_iso, fim_iso = ini.strftime("%Y-%m-%d"), fim.strftime("%Y-%m-%d")
+        df_notas = repo.get_daily_notes_as_dataframe(username, inicio_iso, fim_iso)
+        df_logs = repo.get_logs_as_dataframe_by_range(username, inicio_iso, fim_iso)
 
-    if busca.strip() and not df_notas.empty:
+    dias = _montar_dias_caderno(df_notas, df_logs)
+    if busca.strip():
         termo = _chave_descricao(busca)
-        df_notas = df_notas[df_notas["content"].map(_chave_descricao).str.contains(termo, regex=False)]
+        dias = [dia for dia in dias if _dia_contem_busca(dia, termo)]
 
-    if df_notas.empty:
-        st.info("Nenhuma anotação encontrada.")
+    if not dias:
+        st.info("Nenhum registro ou anotação encontrado.")
     else:
-        total = len(df_notas)
-        if total > CADERNO_LIMITE_DIAS:
-            st.caption(f"Mostrando os {CADERNO_LIMITE_DIAS} dias mais recentes de {total} encontrados -- refine o período ou a busca.")
+        total = len(dias)
+        total_paginas = max(1, (total + CADERNO_DIAS_POR_PAGINA - 1) // CADERNO_DIAS_POR_PAGINA)
+        # O PORQUE: refinar a busca pode deixar menos páginas do que a que
+        # estava aberta, e o number_input quebra com um valor acima do máximo.
+        if st.session_state.get("caderno_pagina", 1) > total_paginas:
+            st.session_state["caderno_pagina"] = total_paginas
+        pagina = 1
+        if total_paginas > 1:
+            pagina = int(st.number_input(
+                f"Página (1-{total_paginas})", min_value=1, max_value=total_paginas, step=1, key="caderno_pagina",
+            ))
+            st.caption(f"{total} dia(s) encontrado(s), do mais recente para o mais antigo.")
         else:
             st.caption(f"{total} dia(s) encontrado(s).")
 
         editando = st.session_state.get("caderno_editando")
-        for _, nota in df_notas.head(CADERNO_LIMITE_DIAS).iterrows():
-            data_iso = str(nota["note_date"])[:10]
-            data_fmt = format_date_ptbr(data_iso)
-            dia_semana = DIAS_DA_SEMANA_PTBR[datetime.strptime(data_iso, "%Y-%m-%d").weekday()]
-            with st.expander(f"📅 {data_fmt} — {dia_semana}", expanded=(total <= 3 or editando == data_iso)):
+        inicio_pagina = (pagina - 1) * CADERNO_DIAS_POR_PAGINA
+        for dia in dias[inicio_pagina:inicio_pagina + CADERNO_DIAS_POR_PAGINA]:
+            data_iso = dia["data"]
+            with st.expander(_rotulo_dia_caderno(dia), expanded=(total <= 3 or editando == data_iso)):
+                if dia["registros"] is not None:
+                    st.markdown("**Registros**")
+                    _texto_puro(_linhas_dos_registros(dia["registros"]))
                 if editando == data_iso:
-                    novo_texto = st.text_area(
-                        "Anotação", value=nota["content"], height=240,
-                        key=f"caderno_txt_{data_iso}", label_visibility="collapsed",
-                    )
-                    st.caption("Deixar o texto vazio apaga a anotação deste dia.")
-                    c_salvar, c_cancelar = st.columns(2)
-                    with c_salvar:
-                        if st.button("Salvar anotação", type="primary", use_container_width=True, key=f"caderno_salvar_{data_iso}"):
-                            request_confirmation(
-                                "caderno_salvar_nota",
-                                {"data": data_iso, "texto": novo_texto},
-                                title="Salvar anotação",
-                                message=(
-                                    f"Substituir a anotação de **{data_fmt}** pelo texto editado?"
-                                    if novo_texto.strip()
-                                    else f"Apagar a anotação de **{data_fmt}**? Os registros de atividade desse dia não mudam."
-                                ),
-                                success_message="Anotação salva.",
-                                processing_message="Salvando...",
-                                confirm_label="Sim, salvar",
-                            )
-                    with c_cancelar:
-                        if st.button("Cancelar", use_container_width=True, key=f"caderno_cancelar_{data_iso}"):
-                            st.session_state.pop("caderno_editando", None)
-                            st.rerun()
+                    st.markdown("**Editar o texto do dia**")
+                    _render_caderno_edicao(dia)
                 else:
-                    # O PORQUE: white-space: pre-wrap preserva as quebras de
-                    # linha e a indentação dos subitens como foram escritas,
-                    # mas ainda quebra linhas longas (URLs do Azure) na largura
-                    # da tela. html.escape porque o texto vai dentro de HTML.
-                    st.markdown(
-                        f"<div style='white-space: pre-wrap; overflow-wrap: anywhere;'>{html.escape(str(nota['content']))}</div>",
-                        unsafe_allow_html=True,
-                    )
+                    if dia["nota"].strip():
+                        st.markdown("**Anotação**")
+                        _texto_puro(dia["nota"])
                     if st.button("✏️ Editar", key=f"caderno_editar_{data_iso}"):
                         st.session_state.caderno_editando = data_iso
+                        st.session_state.caderno_revisao = None
+                        st.session_state.pop("caderno_rascunho", None)
                         st.rerun()
 
     st.markdown("---")
