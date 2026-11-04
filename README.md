@@ -40,9 +40,18 @@ internet (Streamlit Community Cloud).
   duplica nada.
 - Revisão numa tabela totalmente editável antes de salvar. **Só insere,
   nunca apaga** (diferente da Sincronização).
-- **📖 Caderno**: o texto de cada dia fica guardado como foi escrito, com
-  busca por período e por palavra (ignora acentos) e edição. Editar uma
-  anotação não altera os registros.
+- **📖 Caderno**: o histórico dia a dia, com **todos os registros** (lidos
+  direto do banco, venham de Novo Registro, Diário ou Sincronização) e o
+  texto escrito no Diário ou importado. Busca por período e por palavra
+  (ignora acentos) nos dois, com paginação.
+- **Editar um dia no Caderno**: por padrão, muda só o texto. Marcando
+  **Aplicar também nos registros**, uma revisão mostra todos os registros do
+  dia antes de gravar: linha alterada atualiza o registro (mantendo as horas),
+  linha nova cria um registro (com estimativa por IA) e linha apagada exclui.
+  Só o que foi mudado nessa edição vira proposta.
+- **O texto acompanha os registros**: editar ou excluir um registro atualiza a
+  linha correspondente na anotação do dia, e um registro novo é acrescentado
+  antes do `---`. Dia sem anotação continua sem anotação.
 - **Importar histórico do OneNote**: no Caderno, envie um `.txt` no formato
   `dd/mm/aaaa:` + tarefas -- cada dia vira uma anotação (dias que já têm
   anotação são mantidos; nenhum registro é criado).

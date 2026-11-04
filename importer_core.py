@@ -1,6 +1,8 @@
 import re
 import os
 import io
+import difflib
+import unicodedata
 import pandas as pd
 from datetime import datetime
 
@@ -131,6 +133,85 @@ def match_date_header(line: str):
     return None
 
 
+# O PORQUE: separa uma linha de tarefa em marcador/indentação, texto e
+# pontuação final, para trocar só o texto e manter a linha como foi escrita.
+_PARTES_DA_LINHA_RE = re.compile(r'^(\s*[-–•○◦▪*]*\s*)(.*?)([;.]*\s*)$')
+
+# O PORQUE: abaixo disso, duas linhas são tarefas diferentes, e não a mesma
+# tarefa reescrita. Tratar como "alterada" manteria as horas e o projeto da
+# tarefa antiga numa tarefa que não tem nada a ver com ela.
+_SIMILARIDADE_MINIMA_DE_ALTERACAO = 0.5
+
+
+def _eventos_por_linha(raw_text: str) -> list:
+    # O PORQUE: regra única de leitura linha a linha. O Diário usa o resultado
+    # para gerar registros, e o Caderno para achar em qual linha do texto está
+    # cada tarefa. Com duas cópias, um registro poderia deixar de ser
+    # encontrado na própria anotação que o gerou.
+    #
+    # Devolve, em ordem, {"dia": "dd/mm/aaaa"} para cada cabeçalho de data e
+    # {"tarefa", "linha", "linha_prefixo", "prefixo"} para cada tarefa.
+    # "linha" é None quando a tarefa veio junto com a data, na mesma linha.
+    eventos = []
+    prefix = None
+    prefix_line = None
+    prefix_used = False
+    em_anotacoes = False
+
+    def close_prefix():
+        nonlocal prefix, prefix_line, prefix_used
+        if prefix and not prefix_used:
+            eventos.append({"tarefa": prefix, "linha": prefix_line, "linha_prefixo": None, "prefixo": None})
+        prefix, prefix_line, prefix_used = None, None, False
+
+    for indice, raw_line in enumerate(raw_text.splitlines()):
+        line = raw_line.strip()
+        if not line:
+            close_prefix()
+            continue
+        if line.startswith("---"):
+            close_prefix()
+            em_anotacoes = True
+            continue
+        if line.startswith(_SKIP_PREFIXES):
+            continue
+
+        raw_date = match_date_header(line)
+        if raw_date:
+            close_prefix()
+            em_anotacoes = False
+            eventos.append({"dia": raw_date})
+            inline_text = line.replace(raw_date, "").strip(" :-.")
+            if inline_text:
+                eventos.append({"tarefa": inline_text, "linha": None, "linha_prefixo": None, "prefixo": None})
+            continue
+
+        if em_anotacoes:
+            continue
+
+        is_top_level = line.startswith(("-", "–"))
+        text = _LINE_BULLET_RE.sub("", line).strip().rstrip(";.").strip()
+        if not text:
+            continue
+
+        if text.endswith(":"):
+            close_prefix()
+            prefix = text.rstrip(":").strip()
+            prefix_line = indice
+            continue
+
+        if prefix and not is_top_level:
+            eventos.append({"tarefa": f"{prefix}: {text}", "linha": indice, "linha_prefixo": prefix_line, "prefixo": prefix})
+            prefix_used = True
+            continue
+
+        close_prefix()
+        eventos.append({"tarefa": text, "linha": indice, "linha_prefixo": None, "prefixo": None})
+
+    close_prefix()
+    return eventos
+
+
 class HistoryParser:
     def __init__(self, file_path: str = "raw_history.txt"):
         self.file_path = file_path
@@ -239,65 +320,151 @@ class HistoryParser:
         parsed_records = []
         current_date_iso = None
         tasks = []
-        prefix = None
-        prefix_used = False
-        em_anotacoes = False
 
-        def close_prefix():
-            nonlocal prefix, prefix_used
-            if prefix and not prefix_used:
-                tasks.append(prefix)
-            prefix, prefix_used = None, False
-
-        for raw_line in raw_text.splitlines():
-            line = raw_line.strip()
-            if not line:
-                close_prefix()
-                continue
-            if line.startswith("---"):
-                close_prefix()
-                em_anotacoes = True
-                continue
-            if line.startswith(_SKIP_PREFIXES):
-                continue
-
-            raw_date = match_date_header(line)
-            if raw_date:
-                close_prefix()
+        for evento in _eventos_por_linha(raw_text):
+            if "dia" in evento:
                 self._flush_buffer(current_date_iso, tasks, parsed_records)
                 tasks.clear()
-                em_anotacoes = False
-                current_date_iso = self._parse_date(raw_date)
-                inline_text = line.replace(raw_date, "").strip(" :-.")
-                if inline_text:
-                    tasks.append(inline_text)
-                continue
+                current_date_iso = self._parse_date(evento["dia"])
+            elif current_date_iso:
+                tasks.append(evento["tarefa"])
 
-            if not current_date_iso or em_anotacoes:
-                continue
-
-            is_top_level = line.startswith(("-", "–"))
-            text = _LINE_BULLET_RE.sub("", line).strip().rstrip(";.").strip()
-            if not text:
-                continue
-
-            if text.endswith(":"):
-                close_prefix()
-                prefix = text.rstrip(":").strip()
-                continue
-
-            if prefix and not is_top_level:
-                tasks.append(f"{prefix}: {text}")
-                prefix_used = True
-                continue
-
-            close_prefix()
-            tasks.append(text)
-
-        close_prefix()
         self._flush_buffer(current_date_iso, tasks, parsed_records)
 
         return pd.DataFrame(parsed_records, columns=["log_date", "project", "category", "description", "effort_hours", "is_impedimento", "is_duvida"])
+
+    def registros_de_descricoes(self, date_iso: str, descricoes: list) -> pd.DataFrame:
+        # O PORQUE: linhas novas escritas no Caderno já pertencem a um dia
+        # conhecido -- recebem a mesma classificação por palavra-chave do
+        # Diário, sem precisar remontar um texto com cabeçalho de data.
+        parsed_records = []
+        self._flush_buffer(date_iso, descricoes, parsed_records)
+        return pd.DataFrame(parsed_records, columns=["log_date", "project", "category", "description", "effort_hours", "is_impedimento", "is_duvida"])
+
+    @staticmethod
+    def chave_tarefa(texto) -> str:
+        # O PORQUE: compara tarefas ignorando acentos, maiúsculas e a
+        # pontuação final -- "- Reunião X;" na anotação e "reuniao x" no
+        # registro são a mesma tarefa.
+        nfkd = unicodedata.normalize("NFKD", str(texto))
+        sem_acento = "".join(c for c in nfkd if not unicodedata.combining(c))
+        return sem_acento.strip().rstrip(";.").strip().lower()
+
+    @staticmethod
+    def tarefas_do_texto(texto: str) -> list:
+        """Descrições das tarefas do texto de um dia, com a regra do Diário:
+        o que vem depois de uma linha "---" não é tarefa."""
+        return [e["tarefa"] for e in _eventos_por_linha(texto) if "tarefa" in e]
+
+    @staticmethod
+    def tem_texto_alem_das_tarefas(texto: str) -> bool:
+        """True se houver alguma linha que não vire tarefa: anotações depois
+        de "---", linhas ignoradas pelo leitor ou um cabeçalho de data."""
+        eventos = [e for e in _eventos_por_linha(texto) if "tarefa" in e]
+        linhas_de_tarefa = {e["linha"] for e in eventos} | {e["linha_prefixo"] for e in eventos}
+        return any(linha.strip() and i not in linhas_de_tarefa for i, linha in enumerate(texto.splitlines()))
+
+    @staticmethod
+    def comparar_tarefas(texto_antigo: str, texto_novo: str) -> tuple:
+        """Compara duas versões do texto de um dia. Devolve (alteradas,
+        removidas, incluidas), onde alteradas é uma lista de pares (antes,
+        depois). Linhas iguais nas duas versões não aparecem em nenhuma lista.
+
+        O PORQUE: compara o texto com ele mesmo, e não com os registros do
+        dia. Um registro pode ter sido escrito de outro jeito (lançado à mão
+        num dia com histórico importado), e comparar com o banco proporia
+        excluí-lo sem a pessoa ter mexido nele. Assim, só o que foi mudado
+        nesta edição vira proposta."""
+        antigas = HistoryParser.tarefas_do_texto(texto_antigo)
+        novas = HistoryParser.tarefas_do_texto(texto_novo)
+        chave = HistoryParser.chave_tarefa
+
+        def similaridade(a, b):
+            return difflib.SequenceMatcher(None, chave(a), chave(b)).ratio()
+
+        alteradas, removidas, incluidas = [], [], []
+        for op, a1, a2, b1, b2 in difflib.SequenceMatcher(None, antigas, novas, autojunk=False).get_opcodes():
+            if op == "equal":
+                continue
+            livres = novas[b1:b2]
+            for antiga in antigas[a1:a2]:
+                parecida = max(livres, key=lambda nova: similaridade(antiga, nova), default=None)
+                if parecida is not None and similaridade(antiga, parecida) >= _SIMILARIDADE_MINIMA_DE_ALTERACAO:
+                    alteradas.append((antiga, parecida))
+                    livres.remove(parecida)
+                else:
+                    removidas.append(antiga)
+            incluidas.extend(livres)
+
+        # O PORQUE: linha só mudada de lugar aparece como removida + incluída.
+        # Sem isto, trocar duas linhas de ordem excluiria um registro (com as
+        # horas dele) para criar outro igual.
+        for antiga in list(removidas):
+            mesma = next((nova for nova in incluidas if chave(nova) == chave(antiga)), None)
+            if mesma is not None:
+                removidas.remove(antiga)
+                incluidas.remove(mesma)
+                if mesma != antiga:
+                    alteradas.append((antiga, mesma))
+
+        return alteradas, removidas, incluidas
+
+    @staticmethod
+    def trocar_tarefa_no_texto(texto: str, descricao_antiga: str, descricao_nova: str = None) -> tuple:
+        """Troca a linha da tarefa no texto de um dia, ou apaga a linha se
+        descricao_nova for None. Mantém marcador, indentação e pontuação
+        final, e não mexe no que vem depois de "---". Devolve (texto, achou)."""
+        chave = HistoryParser.chave_tarefa
+        eventos = [e for e in _eventos_por_linha(texto) if "tarefa" in e]
+        alvo = next(
+            (e for e in eventos if e["linha"] is not None and chave(e["tarefa"]) == chave(descricao_antiga)),
+            None,
+        )
+        if alvo is None:
+            return texto, False
+
+        linhas = texto.splitlines()
+        trecho_novo = descricao_nova
+        if descricao_nova is not None and alvo["prefixo"]:
+            # O PORQUE: num subitem ("Testes:" + "○ CDT"), a linha guarda só
+            # "CDT". Se o texto novo não começar mais com o prefixo, a tarefa
+            # não pertence mais ao grupo: sai dele e vai para uma linha própria.
+            if chave(descricao_nova).startswith(chave(alvo["prefixo"]) + ":"):
+                trecho_novo = descricao_nova.strip()[len(alvo["prefixo"]):].lstrip(": ")
+            else:
+                trecho_novo = None
+
+        if trecho_novo is not None:
+            partes = _PARTES_DA_LINHA_RE.match(linhas[alvo["linha"]])
+            linhas[alvo["linha"]] = f"{partes.group(1)}{trecho_novo}{partes.group(3)}"
+            return "\n".join(linhas), True
+
+        indices_a_apagar = [alvo["linha"]]
+        # O PORQUE: sem o último subitem, o cabeçalho "Testes:" viraria uma
+        # tarefa sozinho na próxima leitura -- uma tarefa que nunca existiu.
+        if alvo["prefixo"] and sum(e["linha_prefixo"] == alvo["linha_prefixo"] for e in eventos) == 1:
+            indices_a_apagar.append(alvo["linha_prefixo"])
+        for indice in sorted(indices_a_apagar, reverse=True):
+            del linhas[indice]
+
+        texto_novo = "\n".join(linhas)
+        if descricao_nova is not None:
+            texto_novo = HistoryParser.acrescentar_tarefa_no_texto(texto_novo, descricao_nova)
+        return texto_novo, True
+
+    @staticmethod
+    def acrescentar_tarefa_no_texto(texto: str, descricao: str) -> str:
+        """Acrescenta a tarefa depois das outras tarefas do dia, antes de uma
+        eventual linha "---". Se ela já estiver no texto, nada muda."""
+        chave = HistoryParser.chave_tarefa
+        if chave(descricao) in {chave(t) for t in HistoryParser.tarefas_do_texto(texto)}:
+            return texto
+        linhas = texto.splitlines()
+        posicao = next((i for i, linha in enumerate(linhas) if linha.strip().startswith("---")), len(linhas))
+        while posicao > 0 and not linhas[posicao - 1].strip():
+            posicao -= 1
+        linhas.insert(posicao, f"- {descricao}")
+        return "\n".join(linhas)
 
     @staticmethod
     def split_text_by_date(raw_text: str) -> dict:
