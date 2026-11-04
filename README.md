@@ -29,7 +29,8 @@ internet (Streamlit Community Cloud).
   que era escrito no OneNote. Vários dias de uma vez: comece cada dia com a
   data (`dd/mm/aaaa:`). Linha terminada em `:` vira prefixo dos subitens
   logo abaixo (ex.: `Testes Vale Presente:` + `○ CDT` → "Testes Vale
-  Presente: CDT").
+  Presente: CDT"). Uma linha `---` encerra as tarefas do dia: o que vier
+  depois, até a próxima data, fica só no Caderno, sem virar registro.
 - **🤖 Gerar registros**: a IA estima o tempo e classifica projeto/categoria
   de cada linha e fecha o dia em 8h, **descontando o que já está salvo
   naquele dia** (dá pra lançar o dia em mais de uma vez). Sem IA

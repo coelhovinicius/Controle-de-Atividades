@@ -231,11 +231,17 @@ class HistoryParser:
         # prefixo vale até a próxima linha em branco, o próximo item "-" ou
         # a próxima data; se não vier nenhum subitem, o cabeçalho vira uma
         # tarefa sozinho.
+        #
+        # Uma linha "---" encerra as tarefas do dia: o que vem depois, até a
+        # próxima data, são outras anotações (links, impedimentos em aberto).
+        # Elas continuam no Caderno, via split_text_by_date(), mas não viram
+        # registro.
         parsed_records = []
         current_date_iso = None
         tasks = []
         prefix = None
         prefix_used = False
+        em_anotacoes = False
 
         def close_prefix():
             nonlocal prefix, prefix_used
@@ -248,6 +254,10 @@ class HistoryParser:
             if not line:
                 close_prefix()
                 continue
+            if line.startswith("---"):
+                close_prefix()
+                em_anotacoes = True
+                continue
             if line.startswith(_SKIP_PREFIXES):
                 continue
 
@@ -256,13 +266,14 @@ class HistoryParser:
                 close_prefix()
                 self._flush_buffer(current_date_iso, tasks, parsed_records)
                 tasks.clear()
+                em_anotacoes = False
                 current_date_iso = self._parse_date(raw_date)
                 inline_text = line.replace(raw_date, "").strip(" :-.")
                 if inline_text:
                     tasks.append(inline_text)
                 continue
 
-            if not current_date_iso:
+            if not current_date_iso or em_anotacoes:
                 continue
 
             is_top_level = line.startswith(("-", "–"))
