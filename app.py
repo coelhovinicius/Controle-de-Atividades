@@ -13,12 +13,34 @@ import html
 import hmac
 import base64
 import hashlib
+import importlib
+import traceback
 import bcrypt
 import requests
 import secrets as pysecrets
 from io import StringIO
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+import database_core
+import importer_core
+
+
+def _modulo_em_dia(modulo):
+    # O PORQUE: um deploy no Streamlit Cloud não reinicia o processo: o app.py
+    # novo passa a rodar, mas um módulo já importado pode continuar o antigo na
+    # memória. Foi assim que o Novo Registro quebrou com AttributeError num
+    # método que já estava publicado em importer_core.py. Sem assinatura
+    # guardada, recarrega uma vez, porque não dá para saber de quando é aquela
+    # cópia; depois, só quando o arquivo muda.
+    with open(modulo.__file__, "rb") as arquivo:
+        assinatura = hashlib.sha256(arquivo.read()).hexdigest()
+    if getattr(modulo, "_assinatura_do_arquivo", None) != assinatura:
+        importlib.reload(modulo)
+        modulo._assinatura_do_arquivo = assinatura
+
+
+_modulo_em_dia(database_core)
+_modulo_em_dia(importer_core)
 from database_core import DatabaseConnection, LogRepository, TursoRequiredError
 from importer_core import HistoryParser
 
@@ -45,15 +67,13 @@ def get_repository(versao_codigo: str):
 
 def _versao_codigo_banco() -> str:
     # O PORQUE: @st.cache_resource só recria o objeto quando muda o código de
-    # get_repository() ou um argumento dela -- mudar database_core.py não
-    # conta. Como um deploy no Streamlit Cloud não reinicia o processo, o app
-    # continuava com o LogRepository antigo (sem os métodos novos e sem rodar
-    # _initialize_database() para criar tabelas novas) até um reboot manual.
-    # Com o hash do arquivo como argumento, todo deploy que mexe no banco
-    # ganha um repositório novo.
-    caminho = os.path.join(os.path.dirname(os.path.abspath(__file__)), "database_core.py")
-    with open(caminho, "rb") as f:
-        return hashlib.sha256(f.read()).hexdigest()
+    # get_repository() ou um argumento dela -- recarregar database_core.py não
+    # conta. Sem isto, o app continuaria com o LogRepository antigo (sem os
+    # métodos novos e sem rodar _initialize_database() para criar tabelas novas)
+    # até um reboot manual. O id da classe muda a cada recarga, e não o hash do
+    # arquivo, porque um repositório criado a partir de um módulo antigo pode já
+    # estar em cache sob o hash do arquivo novo.
+    return str(id(LogRepository))
 
 
 try:
@@ -2759,7 +2779,16 @@ if st.session_state.processing:
     # a mesma ação de novo -- e uma que já gravou algo gravaria em dobro.
     st.session_state.processing = False
     st.session_state.processing_action = None
-    ok = execute_processing_action(action)
+    try:
+        ok = execute_processing_action(action)
+    except Exception:
+        # O PORQUE: sem isto, a exceção para o script com o overlay ainda na
+        # tela, e o "Processando..." gira para sempre por cima do erro. O
+        # detalhe vai para o log (Manage app), e a tela volta a responder.
+        # st.rerun()/st.stop() não passam aqui: não herdam de Exception.
+        traceback.print_exc()
+        st.session_state._erro_ao_processar = True
+        st.rerun()
     if ok:
         st.toast(action["success_message"], icon="✅")
     else:
@@ -2769,6 +2798,15 @@ if st.session_state.processing:
         )
     time.sleep(0.6)
     st.rerun()
+
+if st.session_state.pop("_erro_ao_processar", False):
+    # O PORQUE: a ação pode ter gravado parte do que devia antes de falhar
+    # (ex.: o registro foi salvo, mas a anotação do dia não foi atualizada).
+    # Repetir sem conferir pode duplicar dados.
+    st.error(
+        "⚠️ Ocorreu um erro e a ação pode não ter terminado. Parte dela pode já ter sido "
+        "gravada: confira os dados antes de tentar de novo, para não duplicar nada."
+    )
 
 if st.session_state.confirm_action:
     render_pending_confirmation()
