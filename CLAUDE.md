@@ -42,7 +42,7 @@ Três módulos na raiz:
 
 - **`database_core.py`**: `DatabaseConnection` conecta no Turso (libsql, envolvido em `_ConexaoComRetentativa`, que reconecta quando a conexão HTTP expira) ou cai para SQLite local; com `REQUIRE_TURSO=true` levanta `TursoRequiredError` em vez de cair. `LogRepository` concentra todo o SQL. **Não há ferramenta de migração**: o schema é criado/evoluído em `_initialize_database()` a cada inicialização (`CREATE TABLE IF NOT EXISTS` + `_ensure_column`). Tabelas: `work_logs`, `custom_options`, `access_requests`, `user_settings`, `daily_notes`.
 - **`importer_core.py`**: `HistoryParser` lê o texto no formato do OneNote (`dd/mm/aaaa:` + tarefas) e classifica por palavra-chave (`PROJECT_KEYWORDS`, `CATEGORY_KEYWORDS`, `IMPEDIMENT_KEYWORDS`, `QUESTION_KEYWORDS`). `parse_text()` é usado pela Sincronização e **precisa continuar produzindo exatamente as mesmas descrições** (a Sincronização compara com o banco por igualdade). O Diário usa `parse_text_por_linha()` (uma linha `---` encerra as tarefas do dia) e `split_text_by_date()` (guarda o texto inteiro para o Caderno). `scripts/import_history.py` é legado e tem cópias próprias das listas de palavras-chave.
-- **`app.py`**: um único script Streamlit (~5 mil linhas) executado de cima para baixo a cada rerun, nesta ordem: conexão (`get_repository()`, `@st.cache_resource`, com o hash de `database_core.py` como argumento: um deploy não reinicia o processo, e sem isso o `LogRepository` antigo continuaria em uso), login (`st.stop()` se não autenticado), helpers e IA, inicialização do `st.session_state`, **dispatcher de ações**, barra lateral, abas.
+- **`app.py`**: um único script Streamlit (~5 mil linhas) executado de cima para baixo a cada rerun, nesta ordem: conexão (um deploy não reinicia o processo e pode deixar módulos antigos na memória: `_modulo_em_dia()` recarrega `database_core` e `importer_core` quando o arquivo muda, e `get_repository()`, com `@st.cache_resource`, recebe o id da classe `LogRepository` como argumento), login (`st.stop()` se não autenticado), helpers e IA, inicialização do `st.session_state`, **dispatcher de ações**, barra lateral, abas.
 
 ### Padrão de escrita no banco (o mais importante para mexer no app)
 
@@ -57,6 +57,7 @@ Consequências desse fluxo:
 - Dentro do dispatcher é seguro escrever em keys de widgets (eles ainda não foram desenhados). Fora dele, não.
 - `st.info`/`st.warning` dentro do dispatcher não aparecem: guarde o resultado no `session_state` e faça `.pop()` na tela, no rerun seguinte (ex.: `_analise_arquivo_ia_info`, `_recalculo_ia_resultado`).
 - Payloads podem carregar DataFrames do `st.data_editor` (capturados antes do rerun).
+- Exceção dentro de uma ação não trava a tela: o traceback vai para o log e o rerun seguinte mostra um `st.error`. No AppTest ela não aparece em `at.exception`: confira também `at.error`.
 
 ### Outras regras do domínio
 
